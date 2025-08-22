@@ -9,7 +9,7 @@ import uvicorn
 TOKEN = os.getenv("BOT_TOKEN")  # токен берём из переменных окружения
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"  # Render подставит имя хоста
-PORT = int(os.getenv("PORT", 10000))
+PORT = int(os.getenv("PORT", 10000))  # Use Render's PORT if set
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -47,13 +47,11 @@ async def clear_old_messages(message: types.Message):
                 pass
     last_bot_messages[user_id] = []
 
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await clear_old_messages(message)
     sent = await message.answer("Главное меню:", reply_markup=main_menu)
     last_bot_messages[message.from_user.id] = [sent.message_id]
-
 
 @dp.message()
 async def main_handler(message: types.Message):
@@ -95,20 +93,22 @@ async def main_handler(message: types.Message):
 
     last_bot_messages[message.from_user.id] = sent_messages
 
-
 # --- FastAPI обработчик вебхуков ---
 @app.post(WEBHOOK_PATH)
 async def webhook_handler(request: Request):
-    update = await request.json()
-    await dp.feed_update(bot, types.Update(**update))
-    return {"ok": True}
-
+    try:
+        update = await request.json()
+        print(f"Received update: {update}")  # Debug log
+        await dp.feed_update(bot, types.Update(**update))
+        return {"ok": True}
+    except Exception as e:
+        print(f"Error processing webhook: {e}")  # Error log
+        return {"ok": False, "error": str(e)}, 500
 
 # --- Установка вебхука при старте ---
 @app.on_event("startup")
 async def on_startup():
     await bot.set_webhook(WEBHOOK_URL)
-
 
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=PORT)
