@@ -23,10 +23,8 @@ app = FastAPI()
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
 try:
-    # Assume base64 encoded JSON; decode and load
     creds_info = json.loads(base64.b64decode(SERVICE_ACCOUNT_KEY).decode('utf-8'))
 except (base64.binascii.Error, ValueError):
-    # Fallback: try direct JSON string
     creds_info = json.loads(SERVICE_ACCOUNT_KEY) if SERVICE_ACCOUNT_KEY else None
 CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES) if creds_info else None
 SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS) if CREDS else None
@@ -55,10 +53,10 @@ async def load_guides():
             for row in values:
                 if len(row) < 3:
                     continue
-                parent = row[0].strip()
+                parent = row[0].strip() if row[0] else None
                 button = row[1].strip()
-                text = row[2].strip()
-                texts[button] = text
+                text = row[2].strip() if row[2] else None
+                texts[button] = text or "Текст не найден в Google Sheets."
                 if not parent:  # Main button
                     main_buttons.append(button)
                 else:  # Subbutton
@@ -101,16 +99,24 @@ def build_submenu(parent):
     buttons.append([KeyboardButton(text="⬅️ Назад")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
+# Store all bot message IDs for each user
 last_bot_messages = {}
 
 async def clear_old_messages(message: types.Message):
+    if not hasattr(message, 'from_user') or not hasattr(message.from_user, 'id'):
+        print("Warning: No user_id available in message.")
+        return
     user_id = message.from_user.id
-    if user_id in last_bot_messages:
-        for msg_id in last_bot_messages[user_id]:
+    if user_id in last_bot_messages and last_bot_messages[user_id]:
+        # Delete messages with a dust-like animation (staggered deletion)
+        msg_ids = last_bot_messages[user_id].copy()
+        for i, msg_id in enumerate(msg_ids):
             try:
                 await bot.delete_message(user_id, msg_id)
+                # Add a small delay between deletions for animation effect
+                await asyncio.sleep(0.2 * (i % 5))  # Varies delay slightly for a "dust" feel
             except Exception as e:
-                print(f"Failed to delete message: {e}")
+                print(f"Failed to delete message {msg_id}: {e}")
         last_bot_messages[user_id] = []
 
 @dp.message(Command("start"))
@@ -124,9 +130,8 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
-    # Restrict to admin (replace with your Telegram ID)
     ADMIN_ID = 123456789  # CHANGE TO YOUR ID
-    if message.from_user.id != ADMIN_ID:
+    if not hasattr(message, 'from_user') or message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещен.")
         return
     await load_guides()
@@ -134,8 +139,11 @@ async def cmd_reload(message: types.Message):
 
 @dp.message()
 async def main_handler(message: types.Message):
+    if not hasattr(message, 'text'):
+        await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
+        return
     txt = message.text.strip()
-    await clear_old_messages(message)
+    await clear_old_messages(message)  # Clear all previous bot messages
     sent_messages = []
 
     if txt == "⬅️ Назад":
@@ -144,8 +152,12 @@ async def main_handler(message: types.Message):
     elif txt in main_buttons:
         if txt in submenus:  # Has subbuttons
             submenu = build_submenu(txt)
-            sent = await message.answer(f"Подменю для {txt}:", reply_markup=submenu)
-            sent_messages.append(sent.message_id)
+            if submenu:
+                sent = await message.answer(f"Подменю для {txt}:", reply_markup=submenu)
+                sent_messages.append(sent.message_id)
+            else:
+                sent = await message.answer(f"Ошибка: Подменю для {txt} не найдено.", reply_markup=main_menu)
+                sent_messages.append(sent.message_id)
         else:  # No subs, send text
             guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
             sent = await message.answer(guide_text, reply_markup=main_menu)
@@ -166,7 +178,10 @@ async def webhook_handler(request: Request):
     try:
         update = await request.json()
         print(f"Received update: {update}")
-        await dp.feed_update(bot, types.Update(**update))
+        if 'message' in update:
+            await dp.feed_update(bot, types.Update(**update))
+        else:
+            print("Update does not contain a message field, skipping.")
         return {"ok": True}
     except Exception as e:
         print(f"Error processing webhook: {e}")
