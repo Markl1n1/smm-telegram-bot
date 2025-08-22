@@ -1,1 +1,3 @@
 aiogram==3.12.0
+fastapi
+uvicorn
