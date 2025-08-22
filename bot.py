@@ -36,51 +36,62 @@ main_buttons = []  # List of main button names
 submenus = {}  # {parent: [subbutton names]}
 texts = {}  # {button: text}
 main_menu = None  # Dynamic main keyboard
+last_modified_time = None  # Track last modified time of the sheet
 
-async def load_guides():
-    global main_buttons, submenus, texts, main_menu
-    main_buttons = []
-    submenus = {}
-    texts = {}
-    if SHEETS_SERVICE:
-        try:
-            sheet = SHEETS_SERVICE.spreadsheets()
-            result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
-            values = result.get('values', [])
-            # Skip headers if present
-            if values and (len(values[0]) < 3 or values[0][1].lower() == "button"):
-                values = values[1:]
-            for row in values:
-                if len(row) < 3:
-                    continue
-                parent = row[0].strip() if row[0] else None
-                button = row[1].strip()
-                text = row[2].strip() if row[2] else None
-                texts[button] = text or "Текст не найден в Google Sheets."
-                if not parent:  # Main button
-                    main_buttons.append(button)
-                else:  # Subbutton
-                    if parent not in submenus:
-                        submenus[parent] = []
-                    submenus[parent].append(button)
-            # Build main menu: 5 buttons per row
-            buttons = []
-            row_buttons = []
-            for btn in main_buttons:
-                row_buttons.append(KeyboardButton(text=btn))
-                if len(row_buttons) == 5:
-                    buttons.append(row_buttons)
-                    row_buttons = []
-            if row_buttons:
-                buttons.append(row_buttons)
-            main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
-            print(f"Loaded main_buttons: {main_buttons}")
-            print(f"Loaded submenus: {submenus}")
-            print(f"Loaded texts: {texts}")
-        except Exception as e:
-            print(f"Error loading guides: {e}")
-    else:
+async def load_guides(force=False):
+    global main_buttons, submenus, texts, main_menu, last_modified_time
+    if not SHEETS_SERVICE:
         print("Google Sheets service not initialized.")
+        return
+
+    try:
+        # Check last modified time to avoid unnecessary reloads
+        if not force:
+            sheet = SHEETS_SERVICE.spreadsheets().get(spreadsheetId=SHEET_ID, fields='modifiedTime').execute()
+            current_modified_time = sheet.get('modifiedTime')
+            if last_modified_time and last_modified_time == current_modified_time:
+                print("No changes detected in Google Sheets.")
+                return
+            last_modified_time = current_modified_time
+
+        # Load data
+        result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
+        values = result.get('values', [])
+        # Skip headers if present
+        if values and (len(values[0]) < 3 or values[0][1].lower() == "button"):
+            values = values[1:]
+        main_buttons = []
+        submenus = {}
+        texts = {}
+        for row in values:
+            if len(row) < 3:
+                continue
+            parent = row[0].strip() if row[0] else None
+            button = row[1].strip()
+            text = row[2].strip() if row[2] else None
+            texts[button] = text or "Текст не найден в Google Sheets."
+            if not parent:  # Main button
+                main_buttons.append(button)
+            else:  # Subbutton
+                if parent not in submenus:
+                    submenus[parent] = []
+                submenus[parent].append(button)
+        # Build main menu: 5 buttons per row
+        buttons = []
+        row_buttons = []
+        for btn in main_buttons:
+            row_buttons.append(KeyboardButton(text=btn))
+            if len(row_buttons) == 5:
+                buttons.append(row_buttons)
+                row_buttons = []
+        if row_buttons:
+            buttons.append(row_buttons)
+        main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
+        print(f"Loaded main_buttons: {main_buttons}")
+        print(f"Loaded submenus: {submenus}")
+        print(f"Loaded texts: {texts}")
+    except Exception as e:
+        print(f"Error loading guides: {e}")
 
 # Build submenu keyboard for a parent
 def build_submenu(parent):
@@ -108,16 +119,19 @@ async def clear_old_messages(message: types.Message):
         return
     user_id = message.from_user.id
     if user_id in last_bot_messages and last_bot_messages[user_id]:
-        # Delete messages with a dust-like animation (staggered deletion)
         msg_ids = last_bot_messages[user_id].copy()
         for i, msg_id in enumerate(msg_ids):
             try:
                 await bot.delete_message(user_id, msg_id)
-                # Add a small delay between deletions for animation effect
-                await asyncio.sleep(0.2 * (i % 5))  # Varies delay slightly for a "dust" feel
+                await asyncio.sleep(0.1 * (i % 5))  # Dust-like animation
             except Exception as e:
                 print(f"Failed to delete message {msg_id}: {e}")
         last_bot_messages[user_id] = []
+
+async def periodic_reload():
+    while True:
+        await load_guides()
+        await asyncio.sleep(3)  # Check every 10 seconds
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -134,7 +148,7 @@ async def cmd_reload(message: types.Message):
     if not hasattr(message, 'from_user') or message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещен.")
         return
-    await load_guides()
+    await load_guides(force=True)  # Force reload regardless of modified time
     await message.answer("Guides reloaded from Google Sheets.")
 
 @dp.message()
@@ -143,7 +157,7 @@ async def main_handler(message: types.Message):
         await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
         return
     txt = message.text.strip()
-    await clear_old_messages(message)  # Clear all previous bot messages
+    await clear_old_messages(message)
     sent_messages = []
 
     if txt == "⬅️ Назад":
@@ -187,11 +201,12 @@ async def webhook_handler(request: Request):
         print(f"Error processing webhook: {e}")
         return {"ok": False, "error": str(e)}, 500
 
-# --- Set webhook and load guides on startup ---
+# --- Set webhook and start periodic reload on startup ---
 @app.on_event("startup")
 async def on_startup():
     await bot.set_webhook(WEBHOOK_URL)
-    await load_guides()
+    await load_guides(force=True)  # Initial load
+    asyncio.create_task(periodic_reload())  # Start periodic reload in background
 
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=PORT)
