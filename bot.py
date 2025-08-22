@@ -31,42 +31,75 @@ except (base64.binascii.Error, ValueError):
 CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES) if creds_info else None
 SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS) if CREDS else None
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-RANGE_NAME = "Guides!A:B"  # Columns A (Button) and B (Text)
+RANGE_NAME = "Guides!A:C"  # Columns A (Parent), B (Button), C (Text)
 
-# Cache guides and buttons
-guides = {}
-buttons_list = []  # List of button names from Sheets
-main_menu = None  # Will be built dynamically
+# Data structures
+main_buttons = []  # List of main button names
+submenus = {}  # {parent: [subbutton names]}
+texts = {}  # {button: text}
+main_menu = None  # Dynamic main keyboard
 
 async def load_guides():
-    global guides, buttons_list, main_menu
+    global main_buttons, submenus, texts, main_menu
+    main_buttons = []
+    submenus = {}
+    texts = {}
     if SHEETS_SERVICE:
         try:
             sheet = SHEETS_SERVICE.spreadsheets()
             result = sheet.values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
             values = result.get('values', [])
-            # Skip first row if headers (assume row[0] like "Button" or empty)
-            if values and (not values[0] or values[0][0].lower() == "button"):
+            # Skip headers if present
+            if values and (len(values[0]) < 3 or values[0][1].lower() == "button"):
                 values = values[1:]
-            guides = {row[0]: row[1] for row in values if len(row) >= 2}
-            buttons_list = list(guides.keys())
-            # Build dynamic keyboard: 4 buttons per row
+            for row in values:
+                if len(row) < 3:
+                    continue
+                parent = row[0].strip()
+                button = row[1].strip()
+                text = row[2].strip()
+                texts[button] = text
+                if not parent:  # Main button
+                    main_buttons.append(button)
+                else:  # Subbutton
+                    if parent not in submenus:
+                        submenus[parent] = []
+                    submenus[parent].append(button)
+            # Build main menu: 5 buttons per row
             buttons = []
             row_buttons = []
-            for btn in buttons_list:
+            for btn in main_buttons:
                 row_buttons.append(KeyboardButton(text=btn))
-                if len(row_buttons) == 4:
+                if len(row_buttons) == 5:
                     buttons.append(row_buttons)
                     row_buttons = []
             if row_buttons:
                 buttons.append(row_buttons)
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
-            print(f"Loaded guides: {guides}")
-            print(f"Loaded buttons: {buttons_list}")
+            print(f"Loaded main_buttons: {main_buttons}")
+            print(f"Loaded submenus: {submenus}")
+            print(f"Loaded texts: {texts}")
         except Exception as e:
             print(f"Error loading guides: {e}")
     else:
         print("Google Sheets service not initialized.")
+
+# Build submenu keyboard for a parent
+def build_submenu(parent):
+    if parent not in submenus:
+        return None
+    subs = submenus[parent]
+    buttons = []
+    row_buttons = []
+    for btn in subs:
+        row_buttons.append(KeyboardButton(text=btn))
+        if len(row_buttons) == 5:
+            buttons.append(row_buttons)
+            row_buttons = []
+    if row_buttons:
+        buttons.append(row_buttons)
+    buttons.append([KeyboardButton(text="⬅️ Назад")])
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 last_bot_messages = {}
 
@@ -92,7 +125,7 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
     # Restrict to admin (replace with your Telegram ID)
-    ADMIN_ID = 123456789  # Change to your ID
+    ADMIN_ID = 123456789  # CHANGE TO YOUR ID
     if message.from_user.id != ADMIN_ID:
         await message.answer("Доступ запрещен.")
         return
@@ -101,12 +134,24 @@ async def cmd_reload(message: types.Message):
 
 @dp.message()
 async def main_handler(message: types.Message):
-    txt = message.text
+    txt = message.text.strip()
     await clear_old_messages(message)
     sent_messages = []
 
-    if txt in guides:
-        guide_text = guides[txt]
+    if txt == "⬅️ Назад":
+        sent = await message.answer("Главное меню:", reply_markup=main_menu)
+        sent_messages.append(sent.message_id)
+    elif txt in main_buttons:
+        if txt in submenus:  # Has subbuttons
+            submenu = build_submenu(txt)
+            sent = await message.answer(f"Подменю для {txt}:", reply_markup=submenu)
+            sent_messages.append(sent.message_id)
+        else:  # No subs, send text
+            guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
+            sent = await message.answer(guide_text, reply_markup=main_menu)
+            sent_messages.append(sent.message_id)
+    elif any(txt in subs for subs in submenus.values()):  # Is a subbutton
+        guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
         sent = await message.answer(guide_text, reply_markup=main_menu)
         sent_messages.append(sent.message_id)
     else:
