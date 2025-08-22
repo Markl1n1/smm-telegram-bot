@@ -24,7 +24,7 @@ for row in range(5):
         row_buttons.append(KeyboardButton(text=f"Кнопка {num}"))
     buttons.append(row_buttons)
 
-main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
 # --- Подменю для кнопки 1 ---
 submenu = ReplyKeyboardMarkup(
@@ -43,15 +43,16 @@ async def clear_old_messages(message: types.Message):
         for msg_id in last_bot_messages[user_id]:
             try:
                 await bot.delete_message(user_id, msg_id)
-            except:
-                pass
-    last_bot_messages[user_id] = []
+            except Exception as e:
+                print(f"Failed to delete message: {e}")  # Debug logging
+        last_bot_messages[user_id] = []
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await clear_old_messages(message)
     sent = await message.answer("Главное меню:", reply_markup=main_menu)
     last_bot_messages[message.from_user.id] = [sent.message_id]
+    print(f"Sent start message with ID {sent.message_id} to {user_id}")  # Debug log
 
 @dp.message()
 async def main_handler(message: types.Message):
@@ -62,19 +63,15 @@ async def main_handler(message: types.Message):
     if txt == "Кнопка 1":
         sent = await message.answer(" ", reply_markup=submenu)
         sent_messages.append(sent.message_id)
-
     elif txt == "Подкнопка 1.1":
-        sent = await message.answer("Текст для подкнопки 1.1")
+        sent = await message.answer("Текст для подкнопки 1.1", reply_markup=main_menu)
         sent_messages.append(sent.message_id)
-
     elif txt == "Подкнопка 1.2":
-        sent = await message.answer("Текст для подкнопки 1.2")
+        sent = await message.answer("Текст для подкнопки 1.2", reply_markup=main_menu)
         sent_messages.append(sent.message_id)
-
     elif txt == "⬅️ Назад":
         sent = await message.answer(" ", reply_markup=main_menu)
         sent_messages.append(sent.message_id)
-
     elif txt == "Кнопка 2":
         media = [
             types.InputMediaPhoto("https://picsum.photos/200/300"),
@@ -82,13 +79,13 @@ async def main_handler(message: types.Message):
         ]
         msgs = await message.answer_media_group(media)
         sent_messages.extend([m.message_id for m in msgs])
-
-    elif txt.startswith("Кнопка"):
-        sent = await message.answer(f"Вы нажали на {txt}. Здесь будет текст/гайд.")
+        sent = await message.answer("Выберите действие:", reply_markup=main_menu)
         sent_messages.append(sent.message_id)
-
+    elif txt.startswith("Кнопка"):
+        sent = await message.answer(f"Вы нажали на {txt}. Здесь будет текст/гайд.", reply_markup=main_menu)
+        sent_messages.append(sent.message_id)
     else:
-        sent = await message.answer("Пожалуйста, используйте кнопки ⬇️")
+        sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
         sent_messages.append(sent.message_id)
 
     last_bot_messages[message.from_user.id] = sent_messages
