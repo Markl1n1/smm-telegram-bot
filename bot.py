@@ -187,7 +187,7 @@ async def cmd_start(message: types.Message):
 async def cmd_reload(message: types.Message):
     user_id = message.from_user.id
     print(f"Received /reload from user {user_id}")
-    ADMIN_ID = 123456789  # CHANGE TO YOUR ID
+    ADMIN_ID = 6970816136  # Your ID
     if user_id != ADMIN_ID:
         sent = await message.answer("Доступ запрещен.")
         last_messages[user_id] = [sent.message_id]
@@ -218,7 +218,7 @@ async def main_handler(message: types.Message):
     sent_messages = []
 
     if not has_access(user_id):
-        if txt == ACCESS_CODE:
+        if txt == "infobot":  # Passcode remains "infobot"
             await grant_access(user_id)
             if not main_menu:
                 sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
