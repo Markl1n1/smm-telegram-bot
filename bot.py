@@ -4,8 +4,9 @@ import json
 import base64
 import time
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
+from aiogram.enums import ParseMode
 from fastapi import FastAPI, Request
 import uvicorn
 from google.oauth2.service_account import Credentials
@@ -120,57 +121,42 @@ async def load_guides(force=False):
                 print("Max retries reached. Failed to load guides.")
                 main_menu = None
 
-# Build submenu keyboard for a parent
-def build_submenu(parent):
+# Build inline keyboard for subbuttons
+def build_submenu_inline(parent):
     if parent not in submenus:
         return None
     subs = submenus[parent]
-    buttons = []
-    row_buttons = []
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for btn in subs:
-        row_buttons.append(KeyboardButton(text=btn))
-        if len(row_buttons) == 5:
-            buttons.append(row_buttons)
-            row_buttons = []
-    if row_buttons:
-        buttons.append(row_buttons)
-    buttons.append([KeyboardButton(text="⬅️ Назад")])
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=f"sub_{btn}")])
+    return keyboard
 
-# Store all bot message IDs for each user
-last_bot_messages = {}
+# Store all bot and user message IDs for each user
+last_messages = {}  # {user_id: [message_ids]}
 
-# User sessions: user_id: expiration_time
-user_sessions = {}
-
-ACCESS_CODE = "infobot"
-SESSION_DURATION = 1800  # 30 minutes in seconds
-
-def has_access(user_id):
-    if user_id in user_sessions:
-        if time.time() < user_sessions[user_id]:
-            return True
-        else:
-            del user_sessions[user_id]
-    return False
-
-async def grant_access(user_id):
-    user_sessions[user_id] = time.time() + SESSION_DURATION
-
-async def clear_old_messages(message: types.Message):
-    if not hasattr(message, 'from_user') or not hasattr(message.from_user, 'id'):
-        print("Warning: No user_id available in message.")
-        return
-    user_id = message.from_user.id
-    if user_id in last_bot_messages and last_bot_messages[user_id]:
-        msg_ids = last_bot_messages[user_id].copy()
+async def clear_old_messages(message_or_callback: types.Message | types.CallbackQuery):
+    if isinstance(message_or_callback, types.Message):
+        user_id = message_or_callback.from_user.id
+    else:  # CallbackQuery
+        user_id = message_or_callback.from_user.id
+    if user_id in last_messages and last_messages[user_id]:
+        msg_ids = last_messages[user_id].copy()
         for i, msg_id in enumerate(msg_ids):
             try:
                 await bot.delete_message(user_id, msg_id)
-                await asyncio.sleep(0.2 * (i % 5))
+                await asyncio.sleep(0.2 * (i % 5))  # Dust-like animation
             except Exception as e:
                 print(f"Failed to delete message {msg_id}: {e}")
-        last_bot_messages[user_id] = []
+        last_messages[user_id] = []
+    # Clear user messages (approximate based on chat history)
+    try:
+        chat_history = await bot.get_chat_history(user_id, limit=10)
+        for msg in chat_history:
+            if msg.from_user and msg.from_user.is_bot:
+                continue  # Skip bot messages (already handled)
+            await bot.delete_message(user_id, msg.message_id)
+    except Exception as e:
+        print(f"Failed to clear user messages: {e}")
 
 async def periodic_reload():
     while True:
@@ -183,31 +169,37 @@ async def cmd_start(message: types.Message):
     await clear_old_messages(message)
     if has_access(user_id):
         if not main_menu:
-            await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
+            sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
+            last_messages[user_id] = [sent.message_id]
             return
         sent = await message.answer("Главное меню:", reply_markup=main_menu)
-        last_bot_messages[user_id] = [sent.message_id]
+        last_messages[user_id] = [sent.message_id]
     else:
         sent = await message.answer("Введите код доступа.")
-        last_bot_messages[user_id] = [sent.message_id]
+        last_messages[user_id] = [sent.message_id]
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
     user_id = message.from_user.id
     ADMIN_ID = 123456789  # CHANGE TO YOUR ID
     if user_id != ADMIN_ID:
-        await message.answer("Доступ запрещен.")
+        sent = await message.answer("Доступ запрещен.")
+        last_messages[user_id] = [sent.message_id]
         return
+    await clear_old_messages(message)
     await load_guides(force=True)
     if main_menu:
-        await message.answer("Guides reloaded from Google Sheets.")
+        sent = await message.answer("Guides reloaded from Google Sheets.", reply_markup=main_menu)
+        last_messages[user_id] = [sent.message_id]
     else:
-        await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.")
+        sent = await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.")
+        last_messages[user_id] = [sent.message_id]
 
 @dp.message()
 async def main_handler(message: types.Message):
     if not hasattr(message, 'text'):
-        await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
+        sent = await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
+        last_messages[message.from_user.id] = [sent.message_id]
         return
     user_id = message.from_user.id
     txt = message.text.strip()
@@ -227,31 +219,38 @@ async def main_handler(message: types.Message):
             sent = await message.answer("Неверный код доступа. Введите код доступа.")
             sent_messages.append(sent.message_id)
     else:
-        if txt == "⬅️ Назад":
-            sent = await message.answer("Главное меню:", reply_markup=main_menu)
-            sent_messages.append(sent.message_id)
-        elif txt in main_buttons:
-            if txt in submenus:
-                submenu = build_submenu(txt)
+        if txt in main_buttons:
+            await clear_old_messages(message)
+            if txt in submenus:  # Has subbuttons
+                submenu = build_submenu_inline(txt)
                 if submenu:
-                    sent = await message.answer(f"Подменю для {txt}:", reply_markup=submenu)
+                    sent = await message.answer(f"Выберите опцию для {txt}:", reply_markup=submenu)
                     sent_messages.append(sent.message_id)
                 else:
                     sent = await message.answer(f"Ошибка: Подменю для {txt} не найдено.", reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
-            else:
+            else:  # No subs, send text
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
                 sent = await message.answer(guide_text, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
-        elif any(txt in subs for subs in submenus.values()):
-            guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
-            sent = await message.answer(guide_text, reply_markup=main_menu)
-            sent_messages.append(sent.message_id)
         else:
             sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
 
-    last_bot_messages[user_id] = sent_messages
+    last_messages[user_id] = sent_messages
+
+# Handle inline button callbacks
+@dp.callback_query()
+async def process_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await clear_old_messages(callback)
+    data = callback.data
+    if data.startswith("sub_"):
+        subbutton = data[4:]  # Extract subbutton text
+        guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.")
+        sent = await callback.message.answer(guide_text, reply_markup=main_menu)
+        last_messages[user_id] = [sent.message_id]
+    await callback.answer()  # Acknowledge the callback
 
 # --- FastAPI webhook handler ---
 @app.post(WEBHOOK_PATH)
@@ -261,8 +260,10 @@ async def webhook_handler(request: Request):
         print(f"Received update: {update}")
         if 'message' in update:
             await dp.feed_update(bot, types.Update(**update))
+        elif 'callback_query' in update:
+            await dp.feed_update(bot, types.Update(**update))
         else:
-            print("Update does not contain a message field, skipping.")
+            print("Update does not contain a message or callback_query field, skipping.")
         return {"ok": True}
     except Exception as e:
         print(f"Error processing webhook: {e}")
@@ -284,3 +285,15 @@ async def on_startup():
 
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=PORT)
+
+# --- Helper Functions ---
+def has_access(user_id):
+    if user_id in user_sessions:
+        if time.time() < user_sessions[user_id]:
+            return True
+        else:
+            del user_sessions[user_id]
+    return False
+
+async def grant_access(user_id):
+    user_sessions[user_id] = time.time() + 1800  # 30 minutes in seconds
