@@ -1,7 +1,6 @@
 import os
 import asyncio
 import json
-import base64
 import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -107,14 +106,16 @@ async def load_guides(force=False):
             print(f"Loaded texts: {texts}")
             return
         except HttpError as e:
-            print(f"HTTP Error {e.resp.status} on attempt {attempt + 1}: {e._get_reason()}")
+            error_details = e._get_reason()
+            print(f"HTTP Error {e.resp.status} on attempt {attempt + 1}: {error_details}")
+            print(f"Error details: {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 + 2 ** attempt)
             else:
                 print("Max retries reached. Failed to load guides.")
                 main_menu = None
         except Exception as e:
-            print(f"Unexpected error on attempt {attempt + 1}: {e}")
+            print(f"Unexpected error on attempt {attempt + 1): {str(e)}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 + 2 ** attempt)
             else:
@@ -229,10 +230,20 @@ async def main_handler(message: types.Message):
                 else:
                     sent = await message.answer(f"Ошибка: Подменю для {txt} не найдено.", reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
-            else:  # No subs, send text
-                guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
-                sent = await message.answer(guide_text, reply_markup=main_menu)
-                sent_messages.append(sent.message_id)
+            else:  # No subs, send text or attachments
+                guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
+                lines = guide_text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
+                        sent = await message.answer_document(line, caption="Attached file")
+                        sent_messages.append(sent.message_id)
+                    else:
+                        if sent_messages:  # Append text after attachments
+                            sent = await message.answer(line, reply_markup=main_menu)
+                        else:  # First non-attachment line
+                            sent = await message.answer(line, reply_markup=main_menu)
+                        sent_messages.append(sent.message_id)
         else:
             sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
@@ -247,9 +258,21 @@ async def process_callback(callback: types.CallbackQuery):
     data = callback.data
     if data.startswith("sub_"):
         subbutton = data[4:]  # Extract subbutton text
-        guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.")
-        sent = await callback.message.answer(guide_text, reply_markup=main_menu)
-        last_messages[user_id] = [sent.message_id]
+        guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
+        sent_messages = []
+        lines = guide_text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
+                sent = await callback.message.answer_document(line, caption="Attached file")
+                sent_messages.append(sent.message_id)
+            else:
+                if sent_messages:  # Append text after attachments
+                    sent = await callback.message.answer(line, reply_markup=main_menu)
+                else:  # First non-attachment line
+                    sent = await callback.message.answer(line, reply_markup=main_menu)
+                sent_messages.append(sent.message_id)
+        last_messages[user_id] = sent_messages
     await callback.answer()  # Acknowledge the callback
 
 # --- FastAPI webhook handler ---
@@ -297,3 +320,6 @@ def has_access(user_id):
 
 async def grant_access(user_id):
     user_sessions[user_id] = time.time() + 1800  # 30 minutes in seconds
+
+# Global session storage
+user_sessions = {}
