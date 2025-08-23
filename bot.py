@@ -115,7 +115,7 @@ async def load_guides(force=False):
                 print("Max retries reached. Failed to load guides.")
                 main_menu = None
         except Exception as e:
-            print(f"Unexpected error on attempt {attempt + 1): {str(e)}")
+            print(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 + 2 ** attempt)
             else:
@@ -167,43 +167,53 @@ async def periodic_reload():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
+    print(f"Received /start from user {user_id}")
     await clear_old_messages(message)
     if has_access(user_id):
         if not main_menu:
             sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
             last_messages[user_id] = [sent.message_id]
+            print(f"Sent error message to {user_id} due to missing main_menu")
             return
         sent = await message.answer("Главное меню:", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
+        print(f"Sent main menu to {user_id}")
     else:
         sent = await message.answer("Введите код доступа.")
         last_messages[user_id] = [sent.message_id]
+        print(f"Sent access prompt to {user_id}")
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
     user_id = message.from_user.id
+    print(f"Received /reload from user {user_id}")
     ADMIN_ID = 123456789  # CHANGE TO YOUR ID
     if user_id != ADMIN_ID:
         sent = await message.answer("Доступ запрещен.")
         last_messages[user_id] = [sent.message_id]
+        print(f"Denied /reload to non-admin user {user_id}")
         return
     await clear_old_messages(message)
     await load_guides(force=True)
     if main_menu:
         sent = await message.answer("Guides reloaded from Google Sheets.", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
+        print(f"Reload successful for user {user_id}")
     else:
         sent = await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.")
         last_messages[user_id] = [sent.message_id]
+        print(f"Reload failed for user {user_id}")
 
 @dp.message()
 async def main_handler(message: types.Message):
     if not hasattr(message, 'text'):
         sent = await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
         last_messages[message.from_user.id] = [sent.message_id]
+        print(f"Invalid input from {message.from_user.id}")
         return
     user_id = message.from_user.id
     txt = message.text.strip()
+    print(f"Received message from {user_id}: {txt}")
     await clear_old_messages(message)
     sent_messages = []
 
@@ -249,11 +259,13 @@ async def main_handler(message: types.Message):
             sent_messages.append(sent.message_id)
 
     last_messages[user_id] = sent_messages
+    print(f"Sent messages to {user_id}: {sent_messages}")
 
 # Handle inline button callbacks
 @dp.callback_query()
 async def process_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    print(f"Received callback from {user_id} with data: {callback.data}")
     await clear_old_messages(callback)
     data = callback.data
     if data.startswith("sub_"):
@@ -273,6 +285,7 @@ async def process_callback(callback: types.CallbackQuery):
                     sent = await callback.message.answer(line, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
         last_messages[user_id] = sent_messages
+        print(f"Sent callback response to {user_id}: {sent_messages}")
     await callback.answer()  # Acknowledge the callback
 
 # --- FastAPI webhook handler ---
