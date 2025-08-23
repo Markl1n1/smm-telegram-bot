@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 import uvicorn
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_PATH = "/webhook"
@@ -24,14 +25,20 @@ app = FastAPI()
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.metadata.readonly']
 SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
 try:
-    creds_info = json.loads(base64.b64decode(SERVICE_ACCOUNT_KEY).decode('utf-8'))
-except (base64.binascii.Error, ValueError):
-    creds_info = json.loads(SERVICE_ACCOUNT_KEY) if SERVICE_ACCOUNT_KEY else None
+    creds_info = json.loads(SERVICE_ACCOUNT_KEY)  # Using raw JSON
+except json.JSONDecodeError as e:
+    print(f"Invalid JSON in GOOGLE_SERVICE_ACCOUNT_KEY: {e}")
+    creds_info = None
 CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES) if creds_info else None
 SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS) if CREDS else None
 DRIVE_SERVICE = build('drive', 'v3', credentials=CREDS) if CREDS else None
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 RANGE_NAME = "Guides!A:C"  # Columns A (Parent), B (Button), C (Text)
+
+print(f"CREDS: {CREDS}")
+print(f"SHEETS_SERVICE: {SHEETS_SERVICE}")
+print(f"DRIVE_SERVICE: {DRIVE_SERVICE}")
+print(f"SHEET_ID: {SHEET_ID}")
 
 # Data structures
 main_buttons = []  # List of main button names
@@ -49,10 +56,12 @@ async def load_guides(force=False):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Check last modified time using Drive API to avoid unnecessary reloads
+            print(f"Attempt {attempt + 1}/{max_retries} to load guides for SHEET_ID: {SHEET_ID}")
+            # Check last modified time using Drive API
             if not force:
                 file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
+                print(f"Current modified time: {current_modified_time}")
                 if last_modified_time and last_modified_time == current_modified_time:
                     print("No changes detected in Google Sheets.")
                     return
@@ -64,7 +73,6 @@ async def load_guides(force=False):
             if not values:
                 print(f"Warning: No data found in range {RANGE_NAME} of sheet {SHEET_ID}.")
                 return
-            # Skip headers if present
             if len(values[0]) < 3 or values[0][1].lower() == "button":
                 values = values[1:]
             main_buttons = []
@@ -77,13 +85,12 @@ async def load_guides(force=False):
                 button = row[1].strip()
                 text = row[2].strip() if row[2] else None
                 texts[button] = text or "Текст не найден в Google Sheets."
-                if not parent:  # Main button
+                if not parent:
                     main_buttons.append(button)
-                else:  # Subbutton
+                else:
                     if parent not in submenus:
                         submenus[parent] = []
                     submenus[parent].append(button)
-            # Build main menu: 5 buttons per row
             buttons = []
             row_buttons = []
             for btn in main_buttons:
@@ -97,14 +104,21 @@ async def load_guides(force=False):
             print(f"Loaded main_buttons: {main_buttons}")
             print(f"Loaded submenus: {submenus}")
             print(f"Loaded texts: {texts}")
-            return  # Success, exit loop
-        except Exception as e:
-            print(f"Attempt {attempt + 1}/{max_retries} failed to load guides: {e}")
+            return
+        except HttpError as e:
+            print(f"HTTP Error {e.resp.status} on attempt {attempt + 1}: {e._get_reason()}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                await asyncio.sleep(5 + 2 ** attempt)
             else:
                 print("Max retries reached. Failed to load guides.")
-                main_menu = None  # Ensure menu is unset on failure
+                main_menu = None
+        except Exception as e:
+            print(f"Unexpected error on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5 + 2 ** attempt)
+            else:
+                print("Max retries reached. Failed to load guides.")
+                main_menu = None
 
 # Build submenu keyboard for a parent
 def build_submenu(parent):
@@ -137,7 +151,7 @@ def has_access(user_id):
         if time.time() < user_sessions[user_id]:
             return True
         else:
-            del user_sessions[user_id]  # Clean up expired session
+            del user_sessions[user_id]
     return False
 
 async def grant_access(user_id):
@@ -153,7 +167,7 @@ async def clear_old_messages(message: types.Message):
         for i, msg_id in enumerate(msg_ids):
             try:
                 await bot.delete_message(user_id, msg_id)
-                await asyncio.sleep(0.2 * (i % 5))  # Dust-like animation
+                await asyncio.sleep(0.2 * (i % 5))
             except Exception as e:
                 print(f"Failed to delete message {msg_id}: {e}")
         last_bot_messages[user_id] = []
@@ -161,7 +175,7 @@ async def clear_old_messages(message: types.Message):
 async def periodic_reload():
     while True:
         await load_guides()
-        await asyncio.sleep(10)  # Check every 10 seconds
+        await asyncio.sleep(10)
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -184,7 +198,7 @@ async def cmd_reload(message: types.Message):
     if user_id != ADMIN_ID:
         await message.answer("Доступ запрещен.")
         return
-    await load_guides(force=True)  # Force reload regardless of modified time
+    await load_guides(force=True)
     if main_menu:
         await message.answer("Guides reloaded from Google Sheets.")
     else:
@@ -217,7 +231,7 @@ async def main_handler(message: types.Message):
             sent = await message.answer("Главное меню:", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
         elif txt in main_buttons:
-            if txt in submenus:  # Has subbuttons
+            if txt in submenus:
                 submenu = build_submenu(txt)
                 if submenu:
                     sent = await message.answer(f"Подменю для {txt}:", reply_markup=submenu)
@@ -225,11 +239,11 @@ async def main_handler(message: types.Message):
                 else:
                     sent = await message.answer(f"Ошибка: Подменю для {txt} не найдено.", reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
-            else:  # No subs, send text
+            else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
                 sent = await message.answer(guide_text, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
-        elif any(txt in subs for subs in submenus.values()):  # Is a subbutton
+        elif any(txt in subs for subs in submenus.values()):
             guide_text = texts.get(txt, "Текст не найден в Google Sheets.")
             sent = await message.answer(guide_text, reply_markup=main_menu)
             sent_messages.append(sent.message_id)
@@ -258,15 +272,15 @@ async def webhook_handler(request: Request):
 @app.on_event("startup")
 async def on_startup():
     await bot.set_webhook(WEBHOOK_URL)
-    for attempt in range(3):  # Retry initial load up to 3 times
+    for attempt in range(3):
         await load_guides(force=True)
         if main_menu:
             break
         print(f"Initial load failed, retrying ({attempt + 1}/3)...")
-        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        await asyncio.sleep(5 + 2 ** attempt)
     if not main_menu:
         print("Failed to load guides after retries. Service may be unstable.")
-    asyncio.create_task(periodic_reload())  # Start periodic reload in background
+    asyncio.create_task(periodic_reload())
 
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=PORT)
