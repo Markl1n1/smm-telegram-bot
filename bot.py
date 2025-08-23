@@ -91,16 +91,9 @@ async def load_guides(force=False):
                     if parent not in submenus:
                         submenus[parent] = []
                     submenus[parent].append(button)
-            buttons = []
-            row_buttons = []
-            for btn in main_buttons:
-                row_buttons.append(KeyboardButton(text=btn))
-                if len(row_buttons) == 5:
-                    buttons.append(row_buttons)
-                    row_buttons = []
-            if row_buttons:
-                buttons.append(row_buttons)
-            main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
+            # Create main menu with adaptive button layout
+            buttons = [KeyboardButton(text=btn) for btn in main_buttons]  # One button per list item
+            main_menu = ReplyKeyboardMarkup(keyboard=[buttons], resize_keyboard=True, is_persistent=True)
             print(f"Loaded main_buttons: {main_buttons}")
             print(f"Loaded submenus: {submenus}")
             print(f"Loaded texts: {texts}")
@@ -167,67 +160,57 @@ async def periodic_reload():
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    print(f"Received /start from user {user_id}")
     await clear_old_messages(message)
     if has_access(user_id):
         if not main_menu:
-            sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
+            sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.", reply_markup=main_menu)
             last_messages[user_id] = [sent.message_id]
-            print(f"Sent error message to {user_id} due to missing main_menu")
             return
         sent = await message.answer("Главное меню:", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
-        print(f"Sent main menu to {user_id}")
     else:
-        sent = await message.answer("Введите код доступа.")
+        sent = await message.answer("Введите код доступа.", reply_markup=main_menu)  # Attach main_menu even for access prompt
         last_messages[user_id] = [sent.message_id]
-        print(f"Sent access prompt to {user_id}")
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
     user_id = message.from_user.id
-    print(f"Received /reload from user {user_id}")
     ADMIN_ID = 6970816136  # Your ID
     if user_id != ADMIN_ID:
-        sent = await message.answer("Доступ запрещен.")
+        sent = await message.answer("Доступ запрещен.", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
-        print(f"Denied /reload to non-admin user {user_id}")
         return
     await clear_old_messages(message)
     await load_guides(force=True)
     if main_menu:
         sent = await message.answer("Guides reloaded from Google Sheets.", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
-        print(f"Reload successful for user {user_id}")
     else:
-        sent = await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.")
+        sent = await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
-        print(f"Reload failed for user {user_id}")
 
 @dp.message()
 async def main_handler(message: types.Message):
     if not hasattr(message, 'text'):
         sent = await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
         last_messages[message.from_user.id] = [sent.message_id]
-        print(f"Invalid input from {message.from_user.id}")
         return
     user_id = message.from_user.id
     txt = message.text.strip()
-    print(f"Received message from {user_id}: {txt}")
     await clear_old_messages(message)
     sent_messages = []
 
     if not has_access(user_id):
-        if txt == "infobot":  # Passcode remains "infobot"
+        if txt == "infobot":
             await grant_access(user_id)
             if not main_menu:
-                sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
+                sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.", reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
             else:
                 sent = await message.answer("Доступ предоставлен на 30 минут. Главное меню:", reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
         else:
-            sent = await message.answer("Неверный код доступа. Введите код доступа.")
+            sent = await message.answer("Неверный код доступа. Введите код доступа.", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
     else:
         if txt in main_buttons:
@@ -246,7 +229,7 @@ async def main_handler(message: types.Message):
                 for line in lines:
                     line = line.strip()
                     if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                        sent = await message.answer_document(line, caption="Attached file")
+                        sent = await message.answer_document(line, caption="Attached file", reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
                     else:
                         if sent_messages:  # Append text after attachments
@@ -259,7 +242,6 @@ async def main_handler(message: types.Message):
             sent_messages.append(sent.message_id)
 
     last_messages[user_id] = sent_messages
-    print(f"Sent messages to {user_id}: {sent_messages}")
 
 # Handle inline button callbacks
 @dp.callback_query()
@@ -276,7 +258,7 @@ async def process_callback(callback: types.CallbackQuery):
         for line in lines:
             line = line.strip()
             if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                sent = await callback.message.answer_document(line, caption="Attached file")
+                sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
             else:
                 if sent_messages:  # Append text after attachments
@@ -285,7 +267,7 @@ async def process_callback(callback: types.CallbackQuery):
                     sent = await callback.message.answer(line, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
         last_messages[user_id] = sent_messages
-        print(f"Sent callback response to {user_id}: {sent_messages}")
+        print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
     await callback.answer()  # Acknowledge the callback
 
 # --- FastAPI webhook handler ---
@@ -297,6 +279,7 @@ async def webhook_handler(request: Request):
         if 'message' in update:
             await dp.feed_update(bot, types.Update(**update))
         elif 'callback_query' in update:
+            print(f"Received callback_query: {update['callback_query']}")
             await dp.feed_update(bot, types.Update(**update))
         else:
             print("Update does not contain a message or callback_query field, skipping.")
