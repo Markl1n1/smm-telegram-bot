@@ -63,7 +63,7 @@ async def load_guides(force=False):
                 current_modified_time = file_metadata.get('modifiedTime')
                 print(f"Current modified time: {current_modified_time}")
                 if last_modified_time and last_modified_time == current_modified_time:
-                    print("No changes detected in Google Sheets.")
+                    print("No changes detected in Google Sheets. Skipping full reload.")
                     return
                 last_modified_time = current_modified_time
 
@@ -131,8 +131,10 @@ last_messages = {}  # {user_id: [message_ids]}
 async def clear_old_messages(message_or_callback: types.Message | types.CallbackQuery):
     if isinstance(message_or_callback, types.Message):
         user_id = message_or_callback.from_user.id
+        current_message_id = message_or_callback.message_id
     else:  # CallbackQuery
         user_id = message_or_callback.from_user.id
+        current_message_id = message_or_callback.message.message_id
     if user_id in last_messages and last_messages[user_id]:
         msg_ids = last_messages[user_id].copy()
         for i, msg_id in enumerate(msg_ids):
@@ -142,20 +144,30 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
             except Exception as e:
                 print(f"Failed to delete message {msg_id}: {e}")
         last_messages[user_id] = []
-    # Clear user messages (approximate based on chat history)
+    # Clear user messages (approximate based on chat history) and current user message
     try:
         chat_history = await bot.get_chat_history(user_id, limit=10)
         for msg in chat_history:
             if msg.from_user and msg.from_user.is_bot:
                 continue  # Skip bot messages (already handled)
-            await bot.delete_message(user_id, msg.message_id)
+            if msg.message_id == current_message_id:  # Delete the triggering user message
+                await bot.delete_message(user_id, msg.message_id)
     except Exception as e:
         print(f"Failed to clear user messages: {e}")
 
 async def periodic_reload():
     while True:
-        await load_guides()
-        await asyncio.sleep(10)
+        if DRIVE_SERVICE and SHEET_ID:
+            try:
+                file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
+                current_modified_time = file_metadata.get('modifiedTime')
+                if last_modified_time and last_modified_time != current_modified_time:
+                    print(f"Change detected at {current_modified_time}. Reloading guides...")
+                    await load_guides(force=True)
+                last_modified_time = current_modified_time
+            except Exception as e:
+                print(f"Error checking modified time: {e}")
+        await asyncio.sleep(60)  # Check every 60 seconds
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -209,6 +221,11 @@ async def main_handler(message: types.Message):
             else:
                 sent = await message.answer("Доступ предоставлен на 30 минут. Главное меню:", reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
+            # Delete the passcode message
+            try:
+                await bot.delete_message(user_id, message.message_id)
+            except Exception as e:
+                print(f"Failed to delete passcode message from {user_id}: {e}")
         else:
             sent = await message.answer("Неверный код доступа. Введите код доступа.", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
