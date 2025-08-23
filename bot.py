@@ -47,8 +47,8 @@ async def load_guides(force=False):
     try:
         # Check last modified time to avoid unnecessary reloads
         if not force:
-            sheet = SHEETS_SERVICE.spreadsheets().get(spreadsheetId=SHEET_ID, fields='modifiedTime').execute()
-            current_modified_time = sheet.get('modifiedTime')
+            sheet = SHEETS_SERVICE.spreadsheets().get(spreadsheetId=SHEET_ID, fields='spreadsheet.properties.modifiedTime').execute()
+            current_modified_time = sheet.get('spreadsheet', {}).get('properties', {}).get('modifiedTime')
             if last_modified_time and last_modified_time == current_modified_time:
                 print("No changes detected in Google Sheets.")
                 return
@@ -92,6 +92,7 @@ async def load_guides(force=False):
         print(f"Loaded texts: {texts}")
     except Exception as e:
         print(f"Error loading guides: {e}")
+        main_menu = None  # Ensure menu is unset on failure to trigger error message
 
 # Build submenu keyboard for a parent
 def build_submenu(parent):
@@ -123,7 +124,7 @@ async def clear_old_messages(message: types.Message):
         for i, msg_id in enumerate(msg_ids):
             try:
                 await bot.delete_message(user_id, msg_id)
-                await asyncio.sleep(0.1 * (i % 5))  # Dust-like animation
+                await asyncio.sleep(0.2 * (i % 5))  # Dust-like animation
             except Exception as e:
                 print(f"Failed to delete message {msg_id}: {e}")
         last_bot_messages[user_id] = []
@@ -131,7 +132,7 @@ async def clear_old_messages(message: types.Message):
 async def periodic_reload():
     while True:
         await load_guides()
-        await asyncio.sleep(3)  # Check every 10 seconds
+        await asyncio.sleep(10)  # Check every 10 seconds
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
