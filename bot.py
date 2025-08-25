@@ -63,7 +63,7 @@ async def load_guides(force=False):
                 current_modified_time = file_metadata.get('modifiedTime')
                 print(f"Current modified time: {current_modified_time}")
                 if last_modified_time and last_modified_time == current_modified_time:
-                    print("No changes detected in Google Sheets. Skipping full reload.")
+                    print("No changes detected in Google Sheets.")
                     return
                 last_modified_time = current_modified_time
 
@@ -92,8 +92,8 @@ async def load_guides(force=False):
                         submenus[parent] = []
                     submenus[parent].append(button)
             # Create main menu with adaptive button layout
-            buttons = [KeyboardButton(text=btn) for btn in main_buttons]  # One button per list item
-            main_menu = ReplyKeyboardMarkup(keyboard=[buttons], resize_keyboard=True, is_persistent=True)
+            buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]  # One button per row for wrapping
+            main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
             print(f"Loaded main_buttons: {main_buttons}")
             print(f"Loaded submenus: {submenus}")
             print(f"Loaded texts: {texts}")
@@ -150,8 +150,9 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
         for msg in chat_history:
             if msg.from_user and msg.from_user.is_bot:
                 continue  # Skip bot messages (already handled)
-            if msg.message_id == current_message_id:  # Delete the triggering user message
-                await bot.delete_message(user_id, msg.message_id)
+            await bot.delete_message(user_id, msg.message_id)
+        # Delete the triggering user message
+        await bot.delete_message(user_id, current_message_id)
     except Exception as e:
         print(f"Failed to clear user messages: {e}")
 
@@ -175,13 +176,13 @@ async def cmd_start(message: types.Message):
     await clear_old_messages(message)
     if has_access(user_id):
         if not main_menu:
-            sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.", reply_markup=main_menu)
+            sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
             last_messages[user_id] = [sent.message_id]
             return
         sent = await message.answer("Главное меню:", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
     else:
-        sent = await message.answer("Введите код доступа.", reply_markup=main_menu)  # Attach main_menu even for access prompt
+        sent = await message.answer("Введите код доступа.")  # No menu before access
         last_messages[user_id] = [sent.message_id]
 
 @dp.message(Command("reload"))
@@ -189,7 +190,7 @@ async def cmd_reload(message: types.Message):
     user_id = message.from_user.id
     ADMIN_ID = 6970816136  # Your ID
     if user_id != ADMIN_ID:
-        sent = await message.answer("Доступ запрещен.", reply_markup=main_menu)
+        sent = await message.answer("Доступ запрещен.")
         last_messages[user_id] = [sent.message_id]
         return
     await clear_old_messages(message)
@@ -198,7 +199,7 @@ async def cmd_reload(message: types.Message):
         sent = await message.answer("Guides reloaded from Google Sheets.", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
     else:
-        sent = await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.", reply_markup=main_menu)
+        sent = await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.")
         last_messages[user_id] = [sent.message_id]
 
 @dp.message()
@@ -227,7 +228,7 @@ async def main_handler(message: types.Message):
             except Exception as e:
                 print(f"Failed to delete passcode message from {user_id}: {e}")
         else:
-            sent = await message.answer("Неверный код доступа. Введите код доступа.", reply_markup=main_menu)
+            sent = await message.answer("Неверный код доступа. Введите код доступа.")  # No menu before access
             sent_messages.append(sent.message_id)
     else:
         if txt in main_buttons:
