@@ -31,7 +31,7 @@ async def health_check():
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.metadata.readonly']
 SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
 try:
-    creds_info = json.loads(SERVICE_ACCOUNT_KEY)  # Using raw JSON
+    creds_info = json.loads(SERVICE_ACCOUNT_KEY)
 except json.JSONDecodeError as e:
     print(f"Invalid JSON in GOOGLE_SERVICE_ACCOUNT_KEY: {e}")
     creds_info = None
@@ -39,7 +39,7 @@ CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES) if cred
 SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS) if CREDS else None
 DRIVE_SERVICE = build('drive', 'v3', credentials=CREDS) if CREDS else None
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-RANGE_NAME = "Guides!A:C"  # Columns A (Parent), B (Button), C (Text)
+RANGE_NAME = "Guides!A:C"
 
 print(f"CREDS: {CREDS}")
 print(f"SHEETS_SERVICE: {SHEETS_SERVICE}")
@@ -47,11 +47,11 @@ print(f"DRIVE_SERVICE: {DRIVE_SERVICE}")
 print(f"SHEET_ID: {SHEET_ID}")
 
 # Data structures
-main_buttons = []  # List of main button names
-submenus = {}  # {parent: [subbutton names]}
-texts = {}  # {button: text}
-main_menu = None  # Dynamic main keyboard
-last_modified_time = None  # Track last modified time of the sheet
+main_buttons = []
+submenus = {}
+texts = {}
+main_menu = None
+last_modified_time = None
 
 async def load_guides(force=False):
     global main_buttons, submenus, texts, main_menu, last_modified_time
@@ -63,7 +63,6 @@ async def load_guides(force=False):
     for attempt in range(max_retries):
         try:
             print(f"Attempt {attempt + 1}/{max_retries} to load guides for SHEET_ID: {SHEET_ID}")
-            # Check last modified time using Drive API
             if not force:
                 file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
@@ -73,7 +72,6 @@ async def load_guides(force=False):
                     return
                 last_modified_time = current_modified_time
 
-            # Load data from Sheets API
             result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
             values = result.get('values', [])
             if not values:
@@ -97,8 +95,7 @@ async def load_guides(force=False):
                     if parent not in submenus:
                         submenus[parent] = []
                     submenus[parent].append(button)
-            # Create main menu with adaptive button layout
-            buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]  # One button per row for wrapping
+            buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
             print(f"Loaded main_buttons: {main_buttons}")
             print(f"Loaded submenus: {submenus}")
@@ -107,7 +104,6 @@ async def load_guides(force=False):
         except HttpError as e:
             error_details = e._get_reason()
             print(f"HTTP Error {e.resp.status} on attempt {attempt + 1}: {error_details}")
-            print(f"Error details: {e}")
             if attempt < max_retries - 1:
                 await asyncio.sleep(5 + 2 ** attempt)
             else:
@@ -121,7 +117,6 @@ async def load_guides(force=False):
                 print("Max retries reached. Failed to load guides.")
                 main_menu = None
 
-# Build inline keyboard for subbuttons
 def build_submenu_inline(parent):
     if parent not in submenus:
         return None
@@ -131,14 +126,13 @@ def build_submenu_inline(parent):
         keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=f"sub_{btn}")])
     return keyboard
 
-# Store all bot and user message IDs for each user
-last_messages = {}  # {user_id: [message_ids]}
+last_messages = {}
 
 async def clear_old_messages(message_or_callback: types.Message | types.CallbackQuery):
     if isinstance(message_or_callback, types.Message):
         user_id = message_or_callback.from_user.id
         current_message_id = message_or_callback.message_id
-    else:  # CallbackQuery
+    else:
         user_id = message_or_callback.from_user.id
         current_message_id = message_or_callback.message.message_id
     if user_id in last_messages and last_messages[user_id]:
@@ -146,11 +140,10 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
         for i, msg_id in enumerate(msg_ids):
             try:
                 await bot.delete_message(user_id, msg_id)
-                await asyncio.sleep(0.2 * (i % 5))  # Dust-like animation
+                await asyncio.sleep(0.2 * (i % 5))
             except Exception as e:
                 print(f"Failed to delete message {msg_id}: {e}")
         last_messages[user_id] = []
-    # Delete the triggering message (user input or inline message)
     try:
         await bot.delete_message(user_id, current_message_id)
     except Exception as e:
@@ -169,7 +162,7 @@ async def periodic_reload():
                 last_modified_time = current_modified_time
             except Exception as e:
                 print(f"Error checking modified time: {e}")
-        await asyncio.sleep(60)  # Check every 60 seconds
+        await asyncio.sleep(60)
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -183,13 +176,13 @@ async def cmd_start(message: types.Message):
         sent = await message.answer("Главное меню:", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
     else:
-        sent = await message.answer("Введите код доступа.")  # No menu before access
+        sent = await message.answer("Введите код доступа.")
         last_messages[user_id] = [sent.message_id]
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
     user_id = message.from_user.id
-    ADMIN_ID = 6970816136  # Your ID
+    ADMIN_ID = 6970816136
     if user_id != ADMIN_ID:
         sent = await message.answer("Доступ запрещен.")
         last_messages[user_id] = [sent.message_id]
@@ -223,18 +216,17 @@ async def main_handler(message: types.Message):
             else:
                 sent = await message.answer("Доступ предоставлен на 30 минут. Главное меню:", reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
-            # Delete the passcode message
             try:
                 await bot.delete_message(user_id, message.message_id)
             except Exception as e:
                 print(f"Failed to delete passcode message from {user_id}: {e}")
         else:
-            sent = await message.answer("Неверный код доступа. Введите код доступа.")  # No menu before access
+            sent = await message.answer("Неверный код доступа. Введите код доступа.")
             sent_messages.append(sent.message_id)
     else:
         if txt in main_buttons:
             await clear_old_messages(message)
-            if txt in submenus:  # Has subbuttons
+            if txt in submenus:
                 submenu = build_submenu_inline(txt)
                 if submenu:
                     sent = await message.answer(f"Выберите опцию для {txt}:", reply_markup=submenu)
@@ -242,7 +234,7 @@ async def main_handler(message: types.Message):
                 else:
                     sent = await message.answer(f"Ошибка: Подменю для {txt} не найдено.", reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
-            else:  # No subs, send text or attachments
+            else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
                 lines = guide_text.split('\n')
                 for line in lines:
@@ -251,9 +243,9 @@ async def main_handler(message: types.Message):
                         sent = await message.answer_document(line, caption="Attached file", reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
                     else:
-                        if sent_messages:  # Append text after attachments
+                        if sent_messages:
                             sent = await message.answer(line, reply_markup=main_menu)
-                        else:  # First non-attachment line
+                        else:
                             sent = await message.answer(line, reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
         else:
@@ -262,7 +254,6 @@ async def main_handler(message: types.Message):
 
     last_messages[user_id] = sent_messages
 
-# Handle inline button callbacks
 @dp.callback_query()
 async def process_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -275,7 +266,7 @@ async def process_callback(callback: types.CallbackQuery):
     data = callback.data
     try:
         if data.startswith("sub_"):
-            subbutton = data[4:]  # Extract subbutton text
+            subbutton = data[4:]
             print(f"Processing subbutton {subbutton} for user {user_id}")
             guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
             sent_messages = []
@@ -286,20 +277,16 @@ async def process_callback(callback: types.CallbackQuery):
                     sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
                 else:
-                    if sent_messages:  # Append text after attachments
-                        sent = await callback.message.answer(line, reply_markup=main_menu)
-                    else:  # First non-attachment line
-                        sent = await callback.message.answer(line, reply_markup=main_menu)
+                    sent = await callback.message.answer(line, reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
             last_messages[user_id] = sent_messages
             print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
-        await callback.answer()  # Acknowledge the callback
+        await callback.answer()
     except Exception as e:
         print(f"Callback error for user {user_id}: {e}")
-        await callback.message.answer("Ошибка обработки. Попробуйте снова.")
+        await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
         await callback.answer()
 
-# --- FastAPI webhook handler ---
 @app.post(WEBHOOK_PATH)
 async def webhook_handler(request: Request):
     try:
@@ -318,13 +305,24 @@ async def webhook_handler(request: Request):
         print(f"Error processing webhook: {e}")
         return {"ok": False, "error": str(e)}, 500
 
-# --- Set webhook and start periodic reload on startup ---
 @app.on_event("startup")
 async def on_startup():
     global last_modified_time
-    last_modified_time = None  # Explicitly initialize
-    await bot.set_webhook(WEBHOOK_URL)
-    for attempt in range(3):
+    last_modified_time = None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"Setting webhook, attempt {attempt + 1}/{max_retries}")
+            await bot.set_webhook(WEBHOOK_URL)
+            print(f"Webhook set to {WEBHOOK_URL}")
+            break
+        except Exception as e:
+            print(f"Failed to set webhook: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5 + 2 ** attempt)
+            else:
+                print("Max retries reached. Webhook setup failed.")
+    for attempt in range(max_retries):
         await load_guides(force=True)
         if main_menu:
             break
@@ -337,7 +335,6 @@ async def on_startup():
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=PORT)
 
-# --- Helper Functions ---
 def has_access(user_id):
     if user_id in user_sessions:
         if time.time() < user_sessions[user_id]:
@@ -347,7 +344,6 @@ def has_access(user_id):
     return False
 
 async def grant_access(user_id):
-    user_sessions[user_id] = time.time() + 1800  # 30 minutes in seconds
+    user_sessions[user_id] = time.time() + 1800
 
-# Global session storage
 user_sessions = {}
