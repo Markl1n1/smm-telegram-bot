@@ -68,7 +68,7 @@ async def load_guides(force=False):
                 file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
                 print(f"Current modified time: {current_modified_time}")
-                if last_modified_time and last_modified_time == current_modified_time:
+                if last_modified_time is not None and last_modified_time == current_modified_time:
                     print("No changes detected in Google Sheets.")
                     return
                 last_modified_time = current_modified_time
@@ -157,12 +157,13 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
         print(f"Failed to delete triggering message {current_message_id}: {e}")
 
 async def periodic_reload():
+    global last_modified_time
     while True:
         if DRIVE_SERVICE and SHEET_ID:
             try:
                 file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
-                if last_modified_time and last_modified_time != current_modified_time:
+                if last_modified_time is not None and last_modified_time != current_modified_time:
                     print(f"Change detected at {current_modified_time}. Reloading guides...")
                     await load_guides(force=True)
                 last_modified_time = current_modified_time
@@ -320,6 +321,8 @@ async def webhook_handler(request: Request):
 # --- Set webhook and start periodic reload on startup ---
 @app.on_event("startup")
 async def on_startup():
+    global last_modified_time
+    last_modified_time = None  # Explicitly initialize
     await bot.set_webhook(WEBHOOK_URL)
     for attempt in range(3):
         await load_guides(force=True)
