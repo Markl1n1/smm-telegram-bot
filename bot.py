@@ -156,7 +156,7 @@ async def periodic_reload():
             try:
                 file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
-                if last_modified_time is not None and last_modified_time != current_modified_time:
+                if current_modified_time and (last_modified_time is None or last_modified_time != current_modified_time):
                     print(f"Change detected at {current_modified_time}. Reloading guides...")
                     await load_guides(force=True)
                 last_modified_time = current_modified_time
@@ -259,50 +259,58 @@ async def process_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     print(f"Received callback from {user_id} with data: {callback.data}")
     if not has_access(user_id):
-        await callback.message.answer("Доступ истек. Введите код доступа.")
+        await callback.message.answer("Доступ истек. Введите код доступа.", reply_markup=main_menu)
         await callback.answer()
         return
-    await clear_old_messages(callback)
+    #await clear_old_messages(callback)  # Temporarily comment to debug
     data = callback.data
-    try:
-        if data.startswith("sub_"):
-            subbutton = data[4:]
-            print(f"Processing subbutton {subbutton} for user {user_id}")
-            guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
-            sent_messages = []
-            lines = guide_text.split('\n')
-            for line in lines:
-                line = line.strip()
-                if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                    sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
-                    sent_messages.append(sent.message_id)
-                else:
-                    sent = await callback.message.answer(line, reply_markup=main_menu)
-                    sent_messages.append(sent.message_id)
-            last_messages[user_id] = sent_messages
-            print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
-        await callback.answer()
-    except Exception as e:
-        print(f"Callback error for user {user_id}: {e}")
-        await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
-        await callback.answer()
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            if data.startswith("sub_"):
+                subbutton = data[4:]
+                print(f"Processing subbutton {subbutton} for user {user_id}")
+                print(f"Texts keys: {texts.keys()}")  # Debug: Check available keys
+                guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
+                sent_messages = []
+                await callback.message.answer("Test response", reply_markup=main_menu)  # Debug: Test API call
+                lines = guide_text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
+                        sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
+                        sent_messages.append(sent.message_id)
+                    else:
+                        sent = await callback.message.answer(line, reply_markup=main_menu)
+                        sent_messages.append(sent.message_id)
+                last_messages[user_id] = sent_messages
+                print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
+            await callback.answer()
+            break
+        except Exception as e:
+            print(f"Callback error for user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(1 + 2 ** attempt)
+            else:
+                await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
+                await callback.answer()
 
 @app.post(WEBHOOK_PATH)
 async def webhook_handler(request: Request):
     try:
         update = await request.json()
-        print(f"Received update: {update}")
+        print(f"Received update at {time.strftime('%H:%M:%S')}: {update}")
         if 'message' in update:
             await dp.feed_update(bot, types.Update(**update))
         elif 'callback_query' in update:
-            print(f"Received callback_query: {update['callback_query']}")
+            print(f"Received callback_query at {time.strftime('%H:%M:%S')}: {update['callback_query']}")
             await dp.feed_update(bot, types.Update(**update))
         else:
             print("Update does not contain a message or callback_query field, skipping.")
         print("Processed update successfully")
         return {"ok": True}
     except Exception as e:
-        print(f"Error processing webhook: {e}")
+        print(f"Error processing webhook at {time.strftime('%H:%M:%S')}: {e}")
         return {"ok": False, "error": str(e)}, 500
 
 @app.on_event("startup")
