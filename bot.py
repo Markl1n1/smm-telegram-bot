@@ -237,16 +237,13 @@ async def main_handler(message: types.Message):
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
                 lines = guide_text.split('\n')
+                sent = await message.answer(guide_text, reply_markup=main_menu)  # Send as single message
+                sent_messages.append(sent.message_id)
+                # Handle attachments separately if needed
                 for line in lines:
                     line = line.strip()
                     if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
                         sent = await message.answer_document(line, caption="Attached file", reply_markup=main_menu)
-                        sent_messages.append(sent.message_id)
-                    else:
-                        if sent_messages:
-                            sent = await message.answer(line, reply_markup=main_menu)
-                        else:
-                            sent = await message.answer(line, reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
         else:
             sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
@@ -262,7 +259,7 @@ async def process_callback(callback: types.CallbackQuery):
         await callback.message.answer("Доступ истек. Введите код доступа.", reply_markup=main_menu)
         await callback.answer()
         return
-    #await clear_old_messages(callback)  # Temporarily comment to debug
+    await clear_old_messages(callback)
     data = callback.data
     max_retries = 2
     for attempt in range(max_retries + 1):
@@ -270,18 +267,16 @@ async def process_callback(callback: types.CallbackQuery):
             if data.startswith("sub_"):
                 subbutton = data[4:]
                 print(f"Processing subbutton {subbutton} for user {user_id}")
-                print(f"Texts keys: {texts.keys()}")  # Debug: Check available keys
                 guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
                 sent_messages = []
-                await callback.message.answer("Test response", reply_markup=main_menu)  # Debug: Test API call
+                sent = await callback.message.answer(guide_text, reply_markup=main_menu)  # Send as single message
+                sent_messages.append(sent.message_id)
+                # Handle attachments separately if needed
                 lines = guide_text.split('\n')
                 for line in lines:
                     line = line.strip()
                     if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
                         sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
-                        sent_messages.append(sent.message_id)
-                    else:
-                        sent = await callback.message.answer(line, reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
                 last_messages[user_id] = sent_messages
                 print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
