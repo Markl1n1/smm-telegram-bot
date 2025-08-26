@@ -21,6 +21,12 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
+# --- Health Check Endpoint ---
+@app.get("/health")
+async def health_check():
+    print("Health check pinged")
+    return {"status": "OK"}
+
 # --- Google Sheets Setup ---
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.metadata.readonly']
 SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
@@ -144,17 +150,11 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
             except Exception as e:
                 print(f"Failed to delete message {msg_id}: {e}")
         last_messages[user_id] = []
-    # Clear user messages (approximate based on chat history) and current user message
+    # Delete the triggering message (user input or inline message)
     try:
-        chat_history = await bot.get_chat_history(user_id, limit=10)
-        for msg in chat_history:
-            if msg.from_user and msg.from_user.is_bot:
-                continue  # Skip bot messages (already handled)
-            await bot.delete_message(user_id, msg.message_id)
-        # Delete the triggering user message
         await bot.delete_message(user_id, current_message_id)
     except Exception as e:
-        print(f"Failed to clear user messages: {e}")
+        print(f"Failed to delete triggering message {current_message_id}: {e}")
 
 async def periodic_reload():
     while True:
@@ -266,27 +266,37 @@ async def main_handler(message: types.Message):
 async def process_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     print(f"Received callback from {user_id} with data: {callback.data}")
+    if not has_access(user_id):
+        await callback.message.answer("Доступ истек. Введите код доступа.")
+        await callback.answer()
+        return
     await clear_old_messages(callback)
     data = callback.data
-    if data.startswith("sub_"):
-        subbutton = data[4:]  # Extract subbutton text
-        guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
-        sent_messages = []
-        lines = guide_text.split('\n')
-        for line in lines:
-            line = line.strip()
-            if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
-                sent_messages.append(sent.message_id)
-            else:
-                if sent_messages:  # Append text after attachments
-                    sent = await callback.message.answer(line, reply_markup=main_menu)
-                else:  # First non-attachment line
-                    sent = await callback.message.answer(line, reply_markup=main_menu)
-                sent_messages.append(sent.message_id)
-        last_messages[user_id] = sent_messages
-        print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
-    await callback.answer()  # Acknowledge the callback
+    try:
+        if data.startswith("sub_"):
+            subbutton = data[4:]  # Extract subbutton text
+            print(f"Processing subbutton {subbutton} for user {user_id}")
+            guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
+            sent_messages = []
+            lines = guide_text.split('\n')
+            for line in lines:
+                line = line.strip()
+                if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
+                    sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
+                    sent_messages.append(sent.message_id)
+                else:
+                    if sent_messages:  # Append text after attachments
+                        sent = await callback.message.answer(line, reply_markup=main_menu)
+                    else:  # First non-attachment line
+                        sent = await callback.message.answer(line, reply_markup=main_menu)
+                    sent_messages.append(sent.message_id)
+            last_messages[user_id] = sent_messages
+            print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
+        await callback.answer()  # Acknowledge the callback
+    except Exception as e:
+        print(f"Callback error for user {user_id}: {e}")
+        await callback.message.answer("Ошибка обработки. Попробуйте снова.")
+        await callback.answer()
 
 # --- FastAPI webhook handler ---
 @app.post(WEBHOOK_PATH)
@@ -301,6 +311,7 @@ async def webhook_handler(request: Request):
             await dp.feed_update(bot, types.Update(**update))
         else:
             print("Update does not contain a message or callback_query field, skipping.")
+        print("Processed update successfully")
         return {"ok": True}
     except Exception as e:
         print(f"Error processing webhook: {e}")
