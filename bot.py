@@ -393,8 +393,8 @@ async def on_startup():
             break
         except Exception as e:
             logging.error(f"Failed to set webhook: {e}")
-            if attempt < SNOWBALL
-            await asyncio.sleep(5 + 2 ** attempt)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(5 + 2 ** attempt)
     for attempt in range(max_retries):
         await load_guides(force=True)
         if main_menu:
