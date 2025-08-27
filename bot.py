@@ -2,80 +2,127 @@ import os
 import asyncio
 import json
 import time
+import logging
+import sqlite3
+import re
+from dataclasses import dataclass
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from fastapi import FastAPI, Request
-import uvicorn
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from cachetools import TTLCache
+from collections import defaultdict
+import uvicorn
 
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
-PORT = int(os.getenv("PORT", 10000))
+# --- Configuration ---
+@dataclass
+class Config:
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN")
+    WEBHOOK_PATH: str = "/webhook"
+    WEBHOOK_URL: str = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
+    PORT: int = int(os.getenv("PORT", 10000))
+    GOOGLE_SERVICE_ACCOUNT_KEY: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
+    SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID")
+    RANGE_NAME: str = "Guides!A:C"
+    ADMIN_ID: int = 6970816136
 
-bot = Bot(token=TOKEN)
+config = Config()
+
+# --- Validate Environment Variables ---
+def validate_env_vars():
+    required_vars = ["BOT_TOKEN", "GOOGLE_SERVICE_ACCOUNT_KEY", "SHEET_ID"]
+    missing = [var for var in required_vars if not getattr(config, var.replace("GOOGLE_", "").upper())]
+    if missing:
+        raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
+
+# --- Logging Setup ---
+logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Bot and FastAPI Setup ---
+bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
 
-# --- Health Check Endpoint ---
-@app.get("/health")
-async def health_check():
-    print("Health check pinged")
-    return {"status": "OK"}
-
 # --- Google Sheets Setup ---
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.metadata.readonly']
-SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
 try:
-    creds_info = json.loads(SERVICE_ACCOUNT_KEY)
+    creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
 except json.JSONDecodeError as e:
-    print(f"Invalid JSON in GOOGLE_SERVICE_ACCOUNT_KEY: {e}")
+    logging.error(f"Invalid JSON in GOOGLE_SERVICE_ACCOUNT_KEY: {e}")
     creds_info = None
 CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES) if creds_info else None
 SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS) if CREDS else None
 DRIVE_SERVICE = build('drive', 'v3', credentials=CREDS) if CREDS else None
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-RANGE_NAME = "Guides!A:C"
 
-print(f"CREDS: {CREDS}")
-print(f"SHEETS_SERVICE: {SHEETS_SERVICE}")
-print(f"DRIVE_SERVICE: {DRIVE_SERVICE}")
-print(f"SHEET_ID: {SHEET_ID}")
-
-# Data structures
+# --- Data Structures ---
 main_buttons = []
 submenus = {}
 texts = {}
 main_menu = None
 last_modified_time = None
+cache = TTLCache(maxsize=1, ttl=300)  # Cache for 5 minutes
+rate_limit = defaultdict(list)
+
+# --- SQLite for User Sessions ---
+def init_db():
+    conn = sqlite3.connect("sessions.db")
+    conn.execute("CREATE TABLE IF NOT EXISTS sessions (user_id INTEGER PRIMARY KEY, expiry REAL)")
+    conn.commit()
+    conn.close()
+
+def has_access(user_id):
+    conn = sqlite3.connect("sessions.db")
+    cursor = conn.execute("SELECT expiry FROM sessions WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row and row[0] > time.time():
+        return True
+    return False
+
+async def grant_access(user_id):
+    expiry = time.time() + 1800  # 30 minutes
+    conn = sqlite3.connect("sessions.db")
+    conn.execute("INSERT OR REPLACE INTO sessions (user_id, expiry) VALUES (?, ?)", (user_id, expiry))
+    conn.commit()
+    conn.close()
+
+# --- Google Sheets Data Loading ---
+def sanitize_text(text: str) -> str:
+    return re.sub(r'[^\w\s-]', '', text.strip())[:100]  # Remove special chars, limit length
 
 async def load_guides(force=False):
     global main_buttons, submenus, texts, main_menu, last_modified_time
+    cache_key = "guides_data"
+    if cache.get(cache_key) and not force:
+        logging.info("Using cached Google Sheets data")
+        main_buttons, submenus, texts, main_menu = cache[cache_key]
+        return
+
     if not SHEETS_SERVICE or not DRIVE_SERVICE:
-        print("Google services not initialized. Check GOOGLE_SERVICE_ACCOUNT_KEY.")
+        logging.error("Google services not initialized. Check GOOGLE_SERVICE_ACCOUNT_KEY.")
         return
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            print(f"Attempt {attempt + 1}/{max_retries} to load guides for SHEET_ID: {SHEET_ID}")
+            logging.info(f"Attempt {attempt + 1}/{max_retries} to load guides for SHEET_ID: {config.SHEET_ID}")
             if not force:
-                file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
+                file_metadata = DRIVE_SERVICE.files().get(fileId=config.SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
-                print(f"Current modified time: {current_modified_time}")
+                logging.info(f"Current modified time: {current_modified_time}")
                 if last_modified_time is not None and last_modified_time == current_modified_time:
-                    print("No changes detected in Google Sheets.")
+                    logging.info("No changes detected in Google Sheets.")
                     return
                 last_modified_time = current_modified_time
 
-            result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=RANGE_NAME).execute()
+            result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=config.SHEET_ID, range=config.RANGE_NAME).execute()
             values = result.get('values', [])
             if not values:
-                print(f"Warning: No data found in range {RANGE_NAME} of sheet {SHEET_ID}.")
+                logging.warning(f"No data found in range {config.RANGE_NAME} of sheet {config.SHEET_ID}.")
                 return
             if len(values[0]) < 3 or values[0][1].lower() == "button":
                 values = values[1:]
@@ -85,10 +132,10 @@ async def load_guides(force=False):
             for row in values:
                 if len(row) < 3:
                     continue
-                parent = row[0].strip() if row[0] else None
-                button = row[1].strip()
-                text = row[2].strip() if row[2] else None
-                texts[button] = text or "Текст не найден в Google Sheets."
+                parent = sanitize_text(row[0]) if row[0] else None
+                button = sanitize_text(row[1])
+                text = sanitize_text(row[2]) if row[2] else "Текст не найден в Google Sheets."
+                texts[button] = text
                 if not parent:
                     main_buttons.append(button)
                 else:
@@ -97,25 +144,26 @@ async def load_guides(force=False):
                     submenus[parent].append(button)
             buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
-            print(f"Loaded main_buttons: {main_buttons}")
-            print(f"Loaded submenus: {submenus}")
-            print(f"Loaded texts: {texts}")
+            cache[cache_key] = (main_buttons, submenus, texts, main_menu)
+            logging.info(f"Loaded main_buttons: {main_buttons}")
+            logging.info(f"Loaded submenus: {submenus}")
+            logging.info(f"Loaded texts: {texts}")
             return
         except HttpError as e:
-            error_details = e._get_reason()
-            print(f"HTTP Error {e.resp.status} on attempt {attempt + 1}: {error_details}")
-            if attempt < max_retries - 1:
+            if e.resp.status == 429:
+                logging.warning(f"Rate limit hit, retrying after delay: {e._get_reason()}")
                 await asyncio.sleep(5 + 2 ** attempt)
             else:
-                print("Max retries reached. Failed to load guides.")
-                main_menu = None
+                logging.error(f"HTTP Error {e.resp.status} on attempt {attempt + 1}: {e._get_reason()}")
+                if attempt == max_retries - 1:
+                    main_menu = None
+                    break
         except Exception as e:
-            print(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(5 + 2 ** attempt)
-            else:
-                print("Max retries reached. Failed to load guides.")
+            logging.error(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
+            if attempt == max_retries - 1:
                 main_menu = None
+                break
+            await asyncio.sleep(5 + 2 ** attempt)
 
 def build_submenu_inline(parent):
     if parent not in submenus:
@@ -126,47 +174,53 @@ def build_submenu_inline(parent):
         keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=f"sub_{btn}")])
     return keyboard
 
+# --- Message Management ---
 last_messages = {}
 
 async def clear_old_messages(message_or_callback: types.Message | types.CallbackQuery):
+    user_id = message_or_callback.from_user.id
     if isinstance(message_or_callback, types.Message):
-        user_id = message_or_callback.from_user.id
         current_message_id = message_or_callback.message_id
     else:
-        user_id = message_or_callback.from_user.id
         current_message_id = message_or_callback.message.message_id
     if user_id in last_messages and last_messages[user_id]:
-        msg_ids = last_messages[user_id].copy()
-        for i, msg_id in enumerate(msg_ids):
-            try:
-                await bot.delete_message(user_id, msg_id)
-                await asyncio.sleep(0.2 * (i % 5))
-            except Exception as e:
-                print(f"Failed to delete message {msg_id}: {e}")
+        try:
+            last_message_id = last_messages[user_id][-1]  # Delete only the most recent
+            await bot.delete_message(user_id, last_message_id)
+        except Exception as e:
+            logging.error(f"Failed to delete message {last_message_id}: {e}")
         last_messages[user_id] = []
     try:
         await bot.delete_message(user_id, current_message_id)
     except Exception as e:
-        print(f"Failed to delete triggering message {current_message_id}: {e}")
+        logging.error(f"Failed to delete triggering message {current_message_id}: {e}")
 
+# --- Periodic Reload ---
 async def periodic_reload():
     global last_modified_time
     while True:
-        if DRIVE_SERVICE and SHEET_ID:
+        if DRIVE_SERVICE and config.SHEET_ID:
             try:
-                file_metadata = DRIVE_SERVICE.files().get(fileId=SHEET_ID, fields='modifiedTime').execute()
+                file_metadata = DRIVE_SERVICE.files().get(fileId=config.SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
                 if current_modified_time and (last_modified_time is None or last_modified_time != current_modified_time):
-                    print(f"Change detected at {current_modified_time}. Reloading guides...")
+                    logging.info(f"Change detected at {current_modified_time}. Reloading guides...")
                     await load_guides(force=True)
                 last_modified_time = current_modified_time
             except Exception as e:
-                print(f"Error checking modified time: {e}")
-        await asyncio.sleep(60)
+                logging.error(f"Error checking modified time: {e}")
+        await asyncio.sleep(300)  # Check every 5 minutes
 
+# --- Telegram Handlers ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
+    rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
+    if len(rate_limit[user_id]) >= 10:
+        await message.answer("Слишком много запросов. Попробуйте позже.")
+        return
+    rate_limit[user_id].append(time.time())
+    
     await clear_old_messages(message)
     if has_access(user_id):
         if not main_menu:
@@ -182,8 +236,13 @@ async def cmd_start(message: types.Message):
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
     user_id = message.from_user.id
-    ADMIN_ID = 6970816136
-    if user_id != ADMIN_ID:
+    rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
+    if len(rate_limit[user_id]) >= 10:
+        await message.answer("Слишком много запросов. Попробуйте позже.")
+        return
+    rate_limit[user_id].append(time.time())
+    
+    if user_id != config.ADMIN_ID:
         sent = await message.answer("Доступ запрещен.")
         last_messages[user_id] = [sent.message_id]
         return
@@ -198,11 +257,17 @@ async def cmd_reload(message: types.Message):
 
 @dp.message()
 async def main_handler(message: types.Message):
+    user_id = message.from_user.id
+    rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
+    if len(rate_limit[user_id]) >= 10:
+        await message.answer("Слишком много запросов. Попробуйте позже.")
+        return
+    rate_limit[user_id].append(time.time())
+    
     if not hasattr(message, 'text'):
         sent = await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
-        last_messages[message.from_user.id] = [sent.message_id]
+        last_messages[user_id] = [sent.message_id]
         return
-    user_id = message.from_user.id
     txt = message.text.strip()
     await clear_old_messages(message)
     sent_messages = []
@@ -219,13 +284,12 @@ async def main_handler(message: types.Message):
             try:
                 await bot.delete_message(user_id, message.message_id)
             except Exception as e:
-                print(f"Failed to delete passcode message from {user_id}: {e}")
+                logging.error(f"Failed to delete passcode message from {user_id}: {e}")
         else:
             sent = await message.answer("Неверный код доступа. Введите код доступа.")
             sent_messages.append(sent.message_id)
     else:
         if txt in main_buttons:
-            await clear_old_messages(message)
             if txt in submenus:
                 submenu = build_submenu_inline(txt)
                 if submenu:
@@ -237,9 +301,8 @@ async def main_handler(message: types.Message):
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
                 lines = guide_text.split('\n')
-                sent = await message.answer(guide_text, reply_markup=main_menu)  # Send as single message
+                sent = await message.answer(guide_text, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
-                # Handle attachments separately if needed
                 for line in lines:
                     line = line.strip()
                     if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
@@ -248,13 +311,19 @@ async def main_handler(message: types.Message):
         else:
             sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
-
     last_messages[user_id] = sent_messages
 
 @dp.callback_query()
 async def process_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    print(f"Received callback from {user_id} with data: {callback.data}")
+    rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
+    if len(rate_limit[user_id]) >= 10:
+        await callback.message.answer("Слишком много запросов. Попробуйте позже.")
+        await callback.answer()
+        return
+    rate_limit[user_id].append(time.time())
+    
+    logging.info(f"Received callback from {user_id} with data: {callback.data}")
     if not has_access(user_id):
         await callback.message.answer("Доступ истек. Введите код доступа.", reply_markup=main_menu)
         await callback.answer()
@@ -266,12 +335,11 @@ async def process_callback(callback: types.CallbackQuery):
         try:
             if data.startswith("sub_"):
                 subbutton = data[4:]
-                print(f"Processing subbutton {subbutton} for user {user_id}")
+                logging.info(f"Processing subbutton {subbutton} for user {user_id}")
                 guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
                 sent_messages = []
-                sent = await callback.message.answer(guide_text, reply_markup=main_menu)  # Send as single message
+                sent = await callback.message.answer(guide_text, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
-                # Handle attachments separately if needed
                 lines = guide_text.split('\n')
                 for line in lines:
                     line = line.strip()
@@ -279,74 +347,63 @@ async def process_callback(callback: types.CallbackQuery):
                         sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
                 last_messages[user_id] = sent_messages
-                print(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
+                logging.info(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
             await callback.answer()
             break
         except Exception as e:
-            print(f"Callback error for user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
+            logging.error(f"Callback error for user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
             if attempt < max_retries:
                 await asyncio.sleep(1 + 2 ** attempt)
             else:
                 await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
                 await callback.answer()
 
-@app.post(WEBHOOK_PATH)
+# --- Webhook Handler ---
+@app.post(config.WEBHOOK_PATH)
 async def webhook_handler(request: Request):
     try:
         update = await request.json()
-        print(f"Received update at {time.strftime('%H:%M:%S')}: {update}")
-        if 'message' in update:
-            await dp.feed_update(bot, types.Update(**update))
-        elif 'callback_query' in update:
-            print(f"Received callback_query at {time.strftime('%H:%M:%S')}: {update['callback_query']}")
-            await dp.feed_update(bot, types.Update(**update))
+        logging.info(f"Received update at {time.strftime('%H:%M:%S')}: {update}")
+        if 'message' in update or 'callback_query' in update:
+            asyncio.create_task(dp.feed_update(bot, types.Update(**update)))
         else:
-            print("Update does not contain a message or callback_query field, skipping.")
-        print("Processed update successfully")
+            logging.info("Update does not contain a message or callback_query field, skipping.")
         return {"ok": True}
     except Exception as e:
-        print(f"Error processing webhook at {time.strftime('%H:%M:%S')}: {e}")
+        logging.error(f"Error processing webhook at {time.strftime('%H:%M:%S')}: {e}")
         return {"ok": False, "error": str(e)}, 500
 
+# --- Startup Logic ---
 @app.on_event("startup")
 async def on_startup():
     global last_modified_time
+    validate_env_vars()
+    init_db()
+    if not SHEETS_SERVICE or not DRIVE_SERVICE:
+        logging.critical("Google services not initialized. Shutting down.")
+        raise SystemExit("Google services initialization failed")
+    
     last_modified_time = None
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            print(f"Setting webhook, attempt {attempt + 1}/{max_retries}")
-            await bot.set_webhook(WEBHOOK_URL)
-            print(f"Webhook set to {WEBHOOK_URL}")
+            logging.info(f"Setting webhook, attempt {attempt + 1}/{max_retries}")
+            await bot.set_webhook(config.WEBHOOK_URL)
+            logging.info(f"Webhook set to {config.WEBHOOK_URL}")
             break
         except Exception as e:
-            print(f"Failed to set webhook: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(5 + 2 ** attempt)
-            else:
-                print("Max retries reached. Webhook setup failed.")
+            logging.error(f"Failed to set webhook: {e}")
+            if attempt < SNOWBALL
+            await asyncio.sleep(5 + 2 ** attempt)
     for attempt in range(max_retries):
         await load_guides(force=True)
         if main_menu:
             break
-        print(f"Initial load failed, retrying ({attempt + 1}/3)...")
+        logging.warning(f"Initial load failed, retrying ({attempt + 1}/3)...")
         await asyncio.sleep(5 + 2 ** attempt)
     if not main_menu:
-        print("Failed to load guides after retries. Service may be unstable.")
+        logging.error("Failed to load guides after retries. Service may be unstable.")
     asyncio.create_task(periodic_reload())
 
 if __name__ == "__main__":
-    uvicorn.run("bot:app", host="0.0.0.0", port=PORT)
-
-def has_access(user_id):
-    if user_id in user_sessions:
-        if time.time() < user_sessions[user_id]:
-            return True
-        else:
-            del user_sessions[user_id]
-    return False
-
-async def grant_access(user_id):
-    user_sessions[user_id] = time.time() + 1800
-
-user_sessions = {}
+    uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT)
