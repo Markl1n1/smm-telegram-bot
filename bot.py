@@ -334,15 +334,20 @@ async def main_handler(message: types.Message):
                     logging.debug(f"No submenu found for {txt} for user {user_id}")
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
-                # Split by whitespace and newlines to handle multiple URLs
+                # Extract and send all image URLs
+                max_retries = 2
                 for url in re.findall(r'https?://[^\s]+', guide_text):
                     if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                        try:
-                            sent = await message.answer_photo(url, caption="Attached image", reply_markup=main_menu)
-                            sent_messages.append(sent.message_id)
-                            logging.debug(f"Sent image attachment {url} to user {user_id}")
-                        except Exception as e:
-                            logging.error(f"Failed to send image {url} to user {user_id}: {e}")
+                        for attempt in range(max_retries + 1):
+                            try:
+                                sent = await message.answer_photo(url, reply_markup=main_menu)
+                                sent_messages.append(sent.message_id)
+                                logging.debug(f"Sent image attachment {url} to user {user_id}")
+                                break
+                            except Exception as e:
+                                logging.error(f"Failed to send image {url} to user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
+                                if attempt < max_retries:
+                                    await asyncio.sleep(1 + 2 ** attempt)
                 # Send remaining text if any
                 text_without_urls = re.sub(r'https?://[^\s]+', '', guide_text).strip()
                 if text_without_urls:
@@ -382,15 +387,19 @@ async def process_callback(callback: types.CallbackQuery):
                 logging.info(f"Processing subbutton {subbutton} for user {user_id}")
                 guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
                 sent_messages = []
-                # Split by whitespace and newlines to handle multiple URLs
+                # Extract and send all image URLs
                 for url in re.findall(r'https?://[^\s]+', guide_text):
                     if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                        try:
-                            sent = await callback.message.answer_photo(url, caption="Attached image", reply_markup=main_menu)
-                            sent_messages.append(sent.message_id)
-                            logging.debug(f"Sent image attachment {url} for subbutton {subbutton} to user {user_id}")
-                        except Exception as e:
-                            logging.error(f"Failed to send image {url} to user {user_id}: {e}")
+                        for attempt in range(max_retries + 1):
+                            try:
+                                sent = await callback.message.answer_photo(url, reply_markup=main_menu)
+                                sent_messages.append(sent.message_id)
+                                logging.debug(f"Sent image attachment {url} for subbutton {subbutton} to user {user_id}")
+                                break
+                            except Exception as e:
+                                logging.error(f"Failed to send image {url} to user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
+                                if attempt < max_retries:
+                                    await asyncio.sleep(1 + 2 ** attempt)
                 # Send remaining text if any
                 text_without_urls = re.sub(r'https?://[^\s]+', '', guide_text).strip()
                 if text_without_urls:
