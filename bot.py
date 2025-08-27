@@ -35,7 +35,7 @@ config = Config()
 # --- Validate Environment Variables ---
 def validate_env_vars():
     required_vars = ["BOT_TOKEN", "GOOGLE_SERVICE_ACCOUNT_KEY", "SHEET_ID"]
-    missing = [var for var in required_vars if not getattr(config, var.replace("GOOGLE_", "").upper())]
+    missing = [var for var in required_vars if not getattr(config, var)]
     if missing:
         raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
 
