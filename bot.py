@@ -37,10 +37,11 @@ def validate_env_vars():
     required_vars = ["BOT_TOKEN", "GOOGLE_SERVICE_ACCOUNT_KEY", "SHEET_ID"]
     missing = [var for var in required_vars if not getattr(config, var)]
     if missing:
+        logging.error(f"Missing environment variables: {', '.join(missing)}")
         raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
 
 # --- Logging Setup ---
-logging.basicConfig(filename='bot.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(filename='bot.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Bot and FastAPI Setup ---
 bot = Bot(token=config.BOT_TOKEN)
@@ -51,12 +52,16 @@ app = FastAPI()
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.metadata.readonly']
 try:
     creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
+    logging.debug("Successfully parsed GOOGLE_SERVICE_ACCOUNT_KEY")
 except json.JSONDecodeError as e:
     logging.error(f"Invalid JSON in GOOGLE_SERVICE_ACCOUNT_KEY: {e}")
     creds_info = None
 CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES) if creds_info else None
 SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS) if CREDS else None
 DRIVE_SERVICE = build('drive', 'v3', credentials=CREDS) if CREDS else None
+
+if not SHEETS_SERVICE or not DRIVE_SERVICE:
+    logging.critical("Google services failed to initialize")
 
 # --- Data Structures ---
 main_buttons = []
@@ -73,6 +78,7 @@ def init_db():
     conn.execute("CREATE TABLE IF NOT EXISTS sessions (user_id INTEGER PRIMARY KEY, expiry REAL)")
     conn.commit()
     conn.close()
+    logging.debug("SQLite database initialized")
 
 def has_access(user_id):
     conn = sqlite3.connect("sessions.db")
@@ -80,7 +86,9 @@ def has_access(user_id):
     row = cursor.fetchone()
     conn.close()
     if row and row[0] > time.time():
+        logging.debug(f"User {user_id} has valid session")
         return True
+    logging.debug(f"User {user_id} has no valid session")
     return False
 
 async def grant_access(user_id):
@@ -89,10 +97,13 @@ async def grant_access(user_id):
     conn.execute("INSERT OR REPLACE INTO sessions (user_id, expiry) VALUES (?, ?)", (user_id, expiry))
     conn.commit()
     conn.close()
+    logging.debug(f"Granted access to user {user_id} until {time.ctime(expiry)}")
 
 # --- Google Sheets Data Loading ---
-def sanitize_text(text: str) -> str:
-    return re.sub(r'[^\w\s-]', '', text.strip())[:100]  # Remove special chars, limit length
+def sanitize_text(text: str, sanitize=True) -> str:
+    if sanitize:
+        return re.sub(r'[^\w\s-]', '', text.strip())[:100]  # Remove special chars, limit length
+    return text.strip()[:100]
 
 async def load_guides(force=False):
     global main_buttons, submenus, texts, main_menu, last_modified_time
@@ -100,6 +111,7 @@ async def load_guides(force=False):
     if cache.get(cache_key) and not force:
         logging.info("Using cached Google Sheets data")
         main_buttons, submenus, texts, main_menu = cache[cache_key]
+        logging.debug(f"Cached main_buttons: {main_buttons}")
         return
 
     if not SHEETS_SERVICE or not DRIVE_SERVICE:
@@ -121,6 +133,7 @@ async def load_guides(force=False):
 
             result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=config.SHEET_ID, range=config.RANGE_NAME).execute()
             values = result.get('values', [])
+            logging.debug(f"Raw Google Sheets data: {values}")
             if not values:
                 logging.warning(f"No data found in range {config.RANGE_NAME} of sheet {config.SHEET_ID}.")
                 return
@@ -131,10 +144,11 @@ async def load_guides(force=False):
             texts = {}
             for row in values:
                 if len(row) < 3:
+                    logging.debug(f"Skipping incomplete row: {row}")
                     continue
-                parent = sanitize_text(row[0]) if row[0] else None
-                button = sanitize_text(row[1])
-                text = sanitize_text(row[2]) if row[2] else "Текст не найден в Google Sheets."
+                parent = sanitize_text(row[0], sanitize=False) if row[0] else None
+                button = sanitize_text(row[1], sanitize=False)
+                text = sanitize_text(row[2], sanitize=False) if row[2] else "Текст не найден в Google Sheets."
                 texts[button] = text
                 if not parent:
                     main_buttons.append(button)
@@ -167,11 +181,13 @@ async def load_guides(force=False):
 
 def build_submenu_inline(parent):
     if parent not in submenus:
+        logging.debug(f"No submenu found for parent: {parent}")
         return None
     subs = submenus[parent]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for btn in subs:
         keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=f"sub_{btn}")])
+    logging.debug(f"Built submenu for {parent}: {subs}")
     return keyboard
 
 # --- Message Management ---
@@ -187,11 +203,13 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
         try:
             last_message_id = last_messages[user_id][-1]  # Delete only the most recent
             await bot.delete_message(user_id, last_message_id)
+            logging.debug(f"Deleted message {last_message_id} for user {user_id}")
         except Exception as e:
             logging.error(f"Failed to delete message {last_message_id}: {e}")
         last_messages[user_id] = []
     try:
         await bot.delete_message(user_id, current_message_id)
+        logging.debug(f"Deleted triggering message {current_message_id} for user {user_id}")
     except Exception as e:
         logging.error(f"Failed to delete triggering message {current_message_id}: {e}")
 
@@ -226,12 +244,15 @@ async def cmd_start(message: types.Message):
         if not main_menu:
             sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.")
             last_messages[user_id] = [sent.message_id]
+            logging.debug(f"Sent error message to user {user_id}: No main menu loaded")
             return
         sent = await message.answer("Главное меню:", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
+        logging.debug(f"Sent main menu to user {user_id}")
     else:
         sent = await message.answer("Введите код доступа.")
         last_messages[user_id] = [sent.message_id]
+        logging.debug(f"Prompted user {user_id} for passcode")
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
@@ -245,15 +266,18 @@ async def cmd_reload(message: types.Message):
     if user_id != config.ADMIN_ID:
         sent = await message.answer("Доступ запрещен.")
         last_messages[user_id] = [sent.message_id]
+        logging.debug(f"Denied reload for non-admin user {user_id}")
         return
     await clear_old_messages(message)
     await load_guides(force=True)
     if main_menu:
         sent = await message.answer("Guides reloaded from Google Sheets.", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
+        logging.debug(f"Reloaded guides for admin {user_id}")
     else:
         sent = await message.answer("Ошибка при перезагрузке guides. Проверьте настройки Google Sheets.")
         last_messages[user_id] = [sent.message_id]
+        logging.debug(f"Failed to reload guides for admin {user_id}")
 
 @dp.message()
 async def main_handler(message: types.Message):
@@ -261,14 +285,17 @@ async def main_handler(message: types.Message):
     rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
     if len(rate_limit[user_id]) >= 10:
         await message.answer("Слишком много запросов. Попробуйте позже.")
+        logging.debug(f"Rate limit exceeded for user {user_id}")
         return
     rate_limit[user_id].append(time.time())
     
     if not hasattr(message, 'text'):
         sent = await message.answer("Неизвестная команда. Используйте кнопки ⬇️", reply_markup=main_menu)
         last_messages[user_id] = [sent.message_id]
+        logging.debug(f"Non-text message received from user {user_id}")
         return
     txt = message.text.strip()
+    logging.debug(f"Received message from user {user_id}: {txt}, main_buttons: {main_buttons}")
     await clear_old_messages(message)
     sent_messages = []
 
@@ -278,39 +305,49 @@ async def main_handler(message: types.Message):
             if not main_menu:
                 sent = await message.answer("Ошибка: Кнопки не загружены из Google Sheets. Попробуйте позже или используйте /reload.", reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
+                logging.debug(f"Passcode accepted but no main menu for user {user_id}")
             else:
                 sent = await message.answer("Доступ предоставлен на 30 минут. Главное меню:", reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
+                logging.debug(f"Passcode accepted, sent main menu to user {user_id}")
             try:
                 await bot.delete_message(user_id, message.message_id)
+                logging.debug(f"Deleted passcode message for user {user_id}")
             except Exception as e:
                 logging.error(f"Failed to delete passcode message from {user_id}: {e}")
         else:
             sent = await message.answer("Неверный код доступа. Введите код доступа.")
             sent_messages.append(sent.message_id)
+            logging.debug(f"Invalid passcode from user {user_id}: {txt}")
     else:
         if txt in main_buttons:
+            logging.debug(f"Valid button pressed by user {user_id}: {txt}")
             if txt in submenus:
                 submenu = build_submenu_inline(txt)
                 if submenu:
                     sent = await message.answer(f"Выберите опцию для {txt}:", reply_markup=submenu)
                     sent_messages.append(sent.message_id)
+                    logging.debug(f"Sent submenu for {txt} to user {user_id}")
                 else:
                     sent = await message.answer(f"Ошибка: Подменю для {txt} не найдено.", reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
+                    logging.debug(f"No submenu found for {txt} for user {user_id}")
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
                 lines = guide_text.split('\n')
                 sent = await message.answer(guide_text, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
+                logging.debug(f"Sent guide text for {txt} to user {user_id}")
                 for line in lines:
                     line = line.strip()
                     if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
                         sent = await message.answer_document(line, caption="Attached file", reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
+                        logging.debug(f"Sent attachment {line} to user {user_id}")
         else:
             sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
+            logging.debug(f"Invalid button {txt} from user {user_id}, main_buttons: {main_buttons}")
     last_messages[user_id] = sent_messages
 
 @dp.callback_query()
@@ -319,6 +356,7 @@ async def process_callback(callback: types.CallbackQuery):
     rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
     if len(rate_limit[user_id]) >= 10:
         await callback.message.answer("Слишком много запросов. Попробуйте позже.")
+        logging.debug(f"Rate limit exceeded for user {user_id}")
         await callback.answer()
         return
     rate_limit[user_id].append(time.time())
@@ -326,6 +364,7 @@ async def process_callback(callback: types.CallbackQuery):
     logging.info(f"Received callback from {user_id} with data: {callback.data}")
     if not has_access(user_id):
         await callback.message.answer("Доступ истек. Введите код доступа.", reply_markup=main_menu)
+        logging.debug(f"Access expired for user {user_id}")
         await callback.answer()
         return
     await clear_old_messages(callback)
@@ -340,12 +379,14 @@ async def process_callback(callback: types.CallbackQuery):
                 sent_messages = []
                 sent = await callback.message.answer(guide_text, reply_markup=main_menu)
                 sent_messages.append(sent.message_id)
+                logging.debug(f"Sent guide text for subbutton {subbutton} to user {user_id}")
                 lines = guide_text.split('\n')
                 for line in lines:
                     line = line.strip()
                     if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
                         sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
                         sent_messages.append(sent.message_id)
+                        logging.debug(f"Sent attachment {line} for subbutton {subbutton} to user {user_id}")
                 last_messages[user_id] = sent_messages
                 logging.info(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
             await callback.answer()
@@ -356,6 +397,7 @@ async def process_callback(callback: types.CallbackQuery):
                 await asyncio.sleep(1 + 2 ** attempt)
             else:
                 await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
+                logging.debug(f"Callback error for user {user_id} after retries")
                 await callback.answer()
 
 # --- Webhook Handler ---
