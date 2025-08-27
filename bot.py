@@ -111,7 +111,7 @@ async def load_guides(force=False):
     if cache.get(cache_key) and not force:
         logging.info("Using cached Google Sheets data")
         main_buttons, submenus, texts, main_menu = cache[cache_key]
-        logging.debug(f"Cached main_buttons: {main_buttons}")
+        logging.debug(f"Cached main_buttons: {main_buttons}, submenus: {submenus}")
         return
 
     if not SHEETS_SERVICE or not DRIVE_SERVICE:
@@ -334,16 +334,21 @@ async def main_handler(message: types.Message):
                     logging.debug(f"No submenu found for {txt} for user {user_id}")
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
-                lines = guide_text.split('\n')
-                sent = await message.answer(guide_text, reply_markup=main_menu)
-                sent_messages.append(sent.message_id)
-                logging.debug(f"Sent guide text for {txt} to user {user_id}")
-                for line in lines:
-                    line = line.strip()
-                    if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                        sent = await message.answer_document(line, caption="Attached file", reply_markup=main_menu)
-                        sent_messages.append(sent.message_id)
-                        logging.debug(f"Sent attachment {line} to user {user_id}")
+                # Split by whitespace and newlines to handle multiple URLs
+                for url in re.findall(r'https?://[^\s]+', guide_text):
+                    if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
+                        try:
+                            sent = await message.answer_photo(url, caption="Attached image", reply_markup=main_menu)
+                            sent_messages.append(sent.message_id)
+                            logging.debug(f"Sent image attachment {url} to user {user_id}")
+                        except Exception as e:
+                            logging.error(f"Failed to send image {url} to user {user_id}: {e}")
+                # Send remaining text if any
+                text_without_urls = re.sub(r'https?://[^\s]+', '', guide_text).strip()
+                if text_without_urls:
+                    sent = await message.answer(text_without_urls, reply_markup=main_menu)
+                    sent_messages.append(sent.message_id)
+                    logging.debug(f"Sent remaining text to user {user_id}: {text_without_urls}")
         else:
             sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
@@ -377,16 +382,21 @@ async def process_callback(callback: types.CallbackQuery):
                 logging.info(f"Processing subbutton {subbutton} for user {user_id}")
                 guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
                 sent_messages = []
-                sent = await callback.message.answer(guide_text, reply_markup=main_menu)
-                sent_messages.append(sent.message_id)
-                logging.debug(f"Sent guide text for subbutton {subbutton} to user {user_id}")
-                lines = guide_text.split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if any(line.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                        sent = await callback.message.answer_document(line, caption="Attached file", reply_markup=main_menu)
-                        sent_messages.append(sent.message_id)
-                        logging.debug(f"Sent attachment {line} for subbutton {subbutton} to user {user_id}")
+                # Split by whitespace and newlines to handle multiple URLs
+                for url in re.findall(r'https?://[^\s]+', guide_text):
+                    if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
+                        try:
+                            sent = await callback.message.answer_photo(url, caption="Attached image", reply_markup=main_menu)
+                            sent_messages.append(sent.message_id)
+                            logging.debug(f"Sent image attachment {url} for subbutton {subbutton} to user {user_id}")
+                        except Exception as e:
+                            logging.error(f"Failed to send image {url} to user {user_id}: {e}")
+                # Send remaining text if any
+                text_without_urls = re.sub(r'https?://[^\s]+', '', guide_text).strip()
+                if text_without_urls:
+                    sent = await callback.message.answer(text_without_urls, reply_markup=main_menu)
+                    sent_messages.append(sent.message_id)
+                    logging.debug(f"Sent remaining text for subbutton {subbutton} to user {user_id}: {text_without_urls}")
                 last_messages[user_id] = sent_messages
                 logging.info(f"Processed callback for subbutton {subbutton} and sent response to {user_id}")
             await callback.answer()
