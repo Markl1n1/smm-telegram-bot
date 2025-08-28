@@ -30,15 +30,17 @@ logging.debug(f"GOOGLE_SHEET_ID: {os.getenv('GOOGLE_SHEET_ID')}")
 logging.debug(f"KOYEB_EXTERNAL_HOSTNAME: {os.getenv('KOYEB_EXTERNAL_HOSTNAME')}")
 logging.debug(f"PORT: {os.getenv('PORT')}")
 
-# --- Configuration ---
 @dataclass
 class Config:
+    # Required fields (no defaults) first
     BOT_TOKEN: str
+    GOOGLE_SERVICE_ACCOUNT_KEY: str
+    SHEET_ID: str
+    
+    # Fields with defaults after
     WEBHOOK_PATH: str = "/webhook"
     WEBHOOK_URL: str = ""
     PORT: int = int(os.getenv("PORT", 8000))
-    GOOGLE_SERVICE_ACCOUNT_KEY: str
-    SHEET_ID: str
     RANGE_NAME: str = "Guides!A:C"
     ADMIN_ID: int = 6970816136
 
