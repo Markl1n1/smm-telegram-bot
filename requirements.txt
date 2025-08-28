@@ -1,7 +1,6 @@
-aiogram==3.13.1
-fastapi==0.111.0
-uvicorn==0.30.1
+aiogram==3.7.0
+fastapi==0.115.0
+google-api-python-client==2.141.0
+google-auth==2.34.0
 python-dotenv==1.0.1
-google-auth==2.29.0
-google-api-python-client==2.142.0
-cachetools==5.3.3
+cachetools==5.5.0
