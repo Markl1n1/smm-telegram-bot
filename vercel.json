@@ -4,6 +4,7 @@
     { "src": "api/webhook.py", "use": "@vercel/python" }
   ],
   "routes": [
-    { "src": "/webhook", "dest": "api/webhook.py" }
+    { "src": "/webhook", "dest": "api/webhook.py" },
+    { "src": "/api/webhook", "dest": "api/webhook.py" }
   ]
 }

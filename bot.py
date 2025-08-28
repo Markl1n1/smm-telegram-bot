@@ -56,9 +56,7 @@ class Config:
     BOT_TOKEN: str
     GOOGLE_SERVICE_ACCOUNT_KEY: str
     SHEET_ID: str
-
     RANGE_NAME: str = "Guides!A:C"
-    ADMIN_ID: int = 6970816136  # информативно – теперь /reload для всех
 
 _raw_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 config = Config(
@@ -68,9 +66,9 @@ config = Config(
 )
 
 if not config.BOT_TOKEN or not config.GOOGLE_SERVICE_ACCOUNT_KEY or not config.SHEET_ID:
-    raise RuntimeError("Missing required envs: BOT_TOKEN, GOOGLE_SERVICE_ACCOUNT_KEY, GOOGLE_SHEET_ID/SHEET_ID")
+    raise RuntimeError("Missing envs: BOT_TOKEN, GOOGLE_SERVICE_ACCOUNT_KEY, GOOGLE_SHEET_ID/SHEET_ID")
 
-# ---------- Globals (жизнь “между” запросами, пока инстанс тёплый) ----------
+# ---------- Globals ----------
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
@@ -88,11 +86,8 @@ submenus: Dict[str, List[str]] = {}
 texts: Dict[str, str] = {}
 main_menu: Optional[ReplyKeyboardMarkup] = None
 
-# Кэш на 5 минут — чтобы меньше ходить в Sheets в рамках тёплого инстанса
-guides_cache = TTLCache(maxsize=1, ttl=300)
-
-# In-memory сессии (30 мин). Для продакшена лучше Redis.
-sessions: Dict[int, float] = {}
+guides_cache = TTLCache(maxsize=1, ttl=300)  # 5 минут
+sessions: Dict[int, float] = {}  # in-memory TTL 30 минут
 
 # ---------- Utils ----------
 URL_RE = re.compile(r'https?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
@@ -133,9 +128,9 @@ def split_media(urls: List[str]):
 def has_access(user_id: int) -> bool:
     now = time.time()
     # чистим протухшие
-    expired = [u for u, t in sessions.items() if t < now]
-    for u in expired:
-        sessions.pop(u, None)
+    for u, t in list(sessions.items()):
+        if t < now:
+            sessions.pop(u, None)
     return sessions.get(user_id, 0) > now
 
 async def grant_access(user_id: int):
@@ -165,7 +160,7 @@ def resolve_btn_from_cb(data: str) -> Optional[str]:
                 return k
     return None
 
-# ---------- Google clients (ленивая инициализация) ----------
+# ---------- Google clients ----------
 def ensure_google():
     global CREDS, SHEETS_SERVICE, DRIVE_SERVICE
     if SHEETS_SERVICE and DRIVE_SERVICE:
@@ -295,7 +290,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
     sent_ids.append(msg.message_id)
     return sent_ids
 
-# ---------- Handlers ----------
+# ---------- Aiogram handlers ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await load_guides()
@@ -306,10 +301,8 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
-    # 1) Жёсткая перезагрузка данных
     guides_cache.clear()
     await load_guides(force=True)
-    # 2) Сбросить доступы
     reset_all_sessions()
     await message.answer("Бот обновлён. Введите код доступа.")
 
@@ -330,7 +323,6 @@ async def main_handler(message: types.Message):
             await message.answer("Введите код доступа.")
         return
 
-    # авторизован
     if txt in main_buttons:
         if txt in submenus:
             kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -369,21 +361,34 @@ async def process_callback(callback: types.CallbackQuery):
         guide_text = texts.get(btn, "Текст не найден в Google Sheets.")
     await send_album_and_text(callback.from_user.id, guide_text.strip())
 
-# ---------- Vercel entry ----------
+# ---------- Vercel entry (ACK fast!) ----------
 @app.post("/")
+@app.post("/webhook")
 async def webhook_entry(request: Request):
     """
-    Точка входа для Vercel: /api/webhook
+    Точка входа для Vercel (через routes на /webhook).
+    Отвечаем 200 сразу и обрабатываем апдейт асинхронно,
+    чтобы Telegram не отваливался по таймауту serverless.
     """
     try:
-        update = types.Update(**(await request.json()))
-        await dp.feed_update(bot, update)
+        payload = await request.json()
+        # Лог подебажа: кто пришёл
+        utype = "callback_query" if "callback_query" in payload else "message" if "message" in payload else list(payload.keys())
+        logging.info(f"Incoming update: {utype}")
+
+        # Парсим как Update
+        update = types.Update(**payload)
+
+        # Стартуем обработку в фоне и МГНОВЕННО отвечаем 200
+        asyncio.create_task(dp.feed_update(bot, update))
         return {"ok": True}
     except Exception as e:
         logging.error(f"Error processing update: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Даже если ошибка — отвечаем 200, чтобы Telegram не флудил ретраями
+        return {"ok": False}
 
-# (опционально) простая проверка
+# Пинг для проверки через браузер
 @app.get("/")
+@app.get("/webhook")
 async def ping():
     return {"status": "ok"}
