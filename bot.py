@@ -6,6 +6,7 @@ import time
 import logging
 import sqlite3
 import re
+import ssl
 import hashlib
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -36,7 +37,6 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
 # приглушим болтовню сторонних библиотек
 logging.getLogger("googleapiclient.discovery").setLevel(logging.WARNING)
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
@@ -71,30 +71,24 @@ class Config:
     PORT: int = int(os.getenv("PORT", "8000"))
 
     def __post_init__(self):
+        """
+        Формируем WEBHOOK_URL без жёсткой зависимости от PUBLIC_URL:
+        1) PUBLIC_URL, если есть;
+        2) KOYEB_PUBLIC_DOMAIN/KOYEB_EXTERNAL_HOSTNAME -> https://<domain>;
+        3) если ничего нет — оставляем WEBHOOK_URL пустым (вебхук ставить не будем).
+        """
         public_url = os.getenv("PUBLIC_URL")
         if not public_url:
             domain = os.getenv("KOYEB_PUBLIC_DOMAIN") or os.getenv("KOYEB_EXTERNAL_HOSTNAME")
             if domain:
                 public_url = f"https://{domain}"
-        if not public_url:
-            raise EnvironmentError(
-                "Не задан PUBLIC_URL и нет KOYEB_PUBLIC_DOMAIN/KOYEB_EXTERNAL_HOSTNAME. "
-                "Добавь PUBLIC_URL = https://{{KOYEB_PUBLIC_DOMAIN}} в переменные окружения."
-            )
-        self.WEBHOOK_URL = f"{public_url}{self.WEBHOOK_PATH}"
+        self.WEBHOOK_URL = f"{public_url}{self.WEBHOOK_PATH}" if public_url else ""
 
 # --- Читаем окружение (с алиасами) и чистим токен ---
 _raw_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 _bot_token = clean_token(_raw_token)
 _sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("SHEET_ID")
 _gsak = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
-
-logging.info(f"BOT_TOKEN: {_mask(_bot_token)} (len={len(_bot_token) if _bot_token else 0})")
-logging.info(f"GOOGLE_SHEET_ID: {bool(_sheet_id)}")
-logging.info(f"GOOGLE_SERVICE_ACCOUNT_KEY set: {bool(_gsak)}")
-logging.info(f"KOYEB_PUBLIC_DOMAIN: {os.getenv('KOYEB_PUBLIC_DOMAIN')}")
-logging.info(f"PUBLIC_URL: {os.getenv('PUBLIC_URL')}")
-logging.info(f"PORT: {os.getenv('PORT')}")
 
 config = Config(
     BOT_TOKEN=_bot_token,
@@ -174,8 +168,8 @@ URL_RE = re.compile(
 )
 
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-VIDEO_EXTS = {".mp4"}            # media group поддерживает фото/видео
-ANIM_EXTS  = {".gif"}            # гиф отправим отдельно как animation
+VIDEO_EXTS = {".mp4"}            # media group: фото/видео
+ANIM_EXTS  = {".gif"}            # гиф — отдельно как animation
 DOC_EXTS   = {".pdf", ".svg"}    # отдельно как документы
 
 def extract_urls_ordered(text: str) -> List[str]:
@@ -215,7 +209,7 @@ def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str], Lis
             docs.append(url)
         else:
             docs.append(url)
-    return media_items[:10], anims, docs  # альбом максимум 10
+    return media_items[:10], anims, docs
 
 async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
     """
@@ -298,6 +292,10 @@ def sanitize_text(text: str, sanitize=True) -> str:
     return text.strip()[:100]
 
 async def load_guides(force=False):
+    """
+    Подтягивает кнопки/тексты из Google Sheets.
+    Транзиентные сетевые ошибки (SSL EOF и т.п.) ретраим и логируем как WARNING.
+    """
     global main_buttons, submenus, texts, main_menu, last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE, cb_map
     cache_key = "guides_data"
     if cache.get(cache_key) and not force:
@@ -308,8 +306,9 @@ async def load_guides(force=False):
         logging.error("Google services not initialized. Check GOOGLE_SERVICE_ACCOUNT_KEY.")
         return
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    max_retries = 4
+    delay = 1.0
+    for attempt in range(1, max_retries + 1):
         try:
             if not force:
                 file_metadata = DRIVE_SERVICE.files().get(fileId=config.SHEET_ID, fields="modifiedTime").execute()
@@ -346,26 +345,37 @@ async def load_guides(force=False):
                     submenus.setdefault(parent, []).append(button)
 
             buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]
+            # is_persistent=True, чтобы клавиатура всегда была доступна
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
             cache[cache_key] = (main_buttons, submenus, texts, main_menu, cb_map)
             logging.info(f"Guides loaded: {len(main_buttons)} main buttons, {sum(len(v) for v in submenus.values())} sub buttons")
             return
+
         except HttpError as e:
             if e.resp.status == 429:
                 logging.warning(f"Rate limit, retrying: {e}")
-                await asyncio.sleep(5 + 2 ** attempt)
+                await asyncio.sleep(max(5.0, delay))
+                delay = min(delay * 2, 10.0)
             else:
                 logging.error(f"HTTP Error {e.resp.status}: {e}")
-                if attempt == max_retries - 1:
+                if attempt == max_retries:
                     main_menu = None
                     break
         except Exception as e:
-            logging.error(f"Unexpected error: {e}")
-            if attempt == max_retries - 1:
+            msg = str(e)
+            # трактуем как транзиентный SSL-глич — ретраим
+            if isinstance(e, ssl.SSLError) or "EOF occurred" in msg or "SSLError" in type(e).__name__:
+                logging.warning(f"Transient SSL error on load_guides (attempt {attempt}/{max_retries}): {e}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10.0)
+                continue
+            logging.error(f"Unexpected error on load_guides (attempt {attempt}/{max_retries}): {e}")
+            if attempt == max_retries:
                 main_menu = None
                 break
-            await asyncio.sleep(5 + 2 ** attempt)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10.0)
 
 def build_submenu_inline(parent: str) -> Optional[InlineKeyboardMarkup]:
     if parent not in submenus:
@@ -563,8 +573,12 @@ async def process_callback(callback: types.CallbackQuery):
         await callback.answer()
 
 # ---------- Веб сервер ----------
-@app.post(config.WEBHOOK_PATH)
+@app.post(config.WEBHOOK_PATH if config.WEBHOOK_URL else "/webhook")
 async def webhook_handler(request: Request):
+    """
+    Если WEBHOOK_URL пустой (не смогли собрать URL) — маршрут всё равно существует,
+    чтобы можно было поставить вебхук вручную на <domain>/webhook.
+    """
     try:
         update = await request.json()
         up_type = "callback_query" if "callback_query" in update else "message" if "message" in update else list(update.keys())
@@ -589,12 +603,19 @@ async def debug_env():
         "bot_token_len": len(config.BOT_TOKEN) if config.BOT_TOKEN else 0,
         "sheet_id_present": bool(config.SHEET_ID),
         "gsak_present": bool(config.GOOGLE_SERVICE_ACCOUNT_KEY),
-        "webhook_url": config.WEBHOOK_URL,
+        "webhook_url": config.WEBHOOK_URL or "(empty)",
     }
 
 # ---------- Установка вебхука с анти-спам логикой ----------
 async def ensure_webhook(bot: Bot, url: str, max_attempts: int = 5):
-    """Ставит вебхук только если он не совпадает; уважает retry_after; делает бэкофф."""
+    """
+    Ставит вебхук только если он не совпадает; уважает retry_after; бэкофф.
+    Если url пуст — просто логируем и выходим.
+    """
+    if not url:
+        logging.info("WEBHOOK_URL is empty; skipping set_webhook. You can set it manually to <domain>/webhook")
+        return
+
     try:
         info = await bot.get_webhook_info()
         current = getattr(info, "url", "") or ""
@@ -630,6 +651,14 @@ async def ensure_webhook(bot: Bot, url: str, max_attempts: int = 5):
 async def on_startup():
     global bot, CREDS, SHEETS_SERVICE, DRIVE_SERVICE, last_modified_time
 
+    # Диагностика окружения (однократно, без дублей)
+    logging.info(f"BOT_TOKEN: {_mask(config.BOT_TOKEN)} (len={len(config.BOT_TOKEN) if config.BOT_TOKEN else 0})")
+    logging.info(f"GOOGLE_SHEET_ID: {bool(config.SHEET_ID)}")
+    logging.info(f"GOOGLE_SERVICE_ACCOUNT_KEY set: {bool(config.GOOGLE_SERVICE_ACCOUNT_KEY)}")
+    logging.info(f"KOYEB_PUBLIC_DOMAIN: {os.getenv('KOYEB_PUBLIC_DOMAIN')}")
+    logging.info(f"PUBLIC_URL: {os.getenv('PUBLIC_URL')}")
+    logging.info(f"PORT: {config.PORT}")
+
     validate_env_vars()
     bot = Bot(token=config.BOT_TOKEN)
 
@@ -646,7 +675,7 @@ async def on_startup():
     init_db()
     last_modified_time = None
 
-    # Ставим вебхук безопасно для мультиворкеров
+    # Ставим вебхук безопасно для мультиворкеров (но мы ниже принудительно запускаем 1 воркер)
     await ensure_webhook(bot, config.WEBHOOK_URL)
 
     await load_guides(force=True)
@@ -665,6 +694,5 @@ async def keep_alive():
         await asyncio.sleep(300)
 
 if __name__ == "__main__":
-    # Управляем числом воркеров через переменные окружения (по умолчанию 1)
-    workers = int(os.getenv("UVICORN_WORKERS", os.getenv("WEB_CONCURRENCY", "1")))
-    uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT, workers=workers)
+    # Принудительно 1 воркер, чтобы не было дублирования логов/инициализаций
+    uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT, workers=1)
