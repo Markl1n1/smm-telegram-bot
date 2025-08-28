@@ -22,6 +22,14 @@ from dotenv import load_dotenv
 # Load .env file for local development
 load_dotenv()
 
+# Debug environment variables
+logging.basicConfig(filename='bot.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.debug(f"BOT_TOKEN: {os.getenv('BOT_TOKEN')}")
+logging.debug(f"GOOGLE_SERVICE_ACCOUNT_KEY: {os.getenv('GOOGLE_SERVICE_ACCOUNT_KEY')[:50] if os.getenv('GOOGLE_SERVICE_ACCOUNT_KEY') else None}...")
+logging.debug(f"GOOGLE_SHEET_ID: {os.getenv('GOOGLE_SHEET_ID')}")
+logging.debug(f"KOYEB_EXTERNAL_HOSTNAME: {os.getenv('KOYEB_EXTERNAL_HOSTNAME')}")
+logging.debug(f"PORT: {os.getenv('PORT')}")
+
 # --- Configuration ---
 @dataclass
 class Config:
@@ -60,9 +68,6 @@ def validate_env_vars():
     if missing:
         logging.error(f"Missing or invalid environment variables: {', '.join(missing)}")
         raise EnvironmentError(f"Missing or invalid environment variables: {', '.join(missing)}")
-
-# --- Logging Setup ---
-logging.basicConfig(filename='bot.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Bot and FastAPI Setup ---
 bot = Bot(token=config.BOT_TOKEN)
