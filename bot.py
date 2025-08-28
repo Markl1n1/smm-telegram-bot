@@ -17,28 +17,49 @@ from googleapiclient.errors import HttpError
 from cachetools import TTLCache
 from collections import defaultdict
 import uvicorn
+from dotenv import load_dotenv
+
+# Load .env file for local development
+load_dotenv()
 
 # --- Configuration ---
 @dataclass
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN")
+    BOT_TOKEN: str
     WEBHOOK_PATH: str = "/webhook"
-    WEBHOOK_URL: str = f"https://{os.getenv('KOYEB_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
+    WEBHOOK_URL: str = ""
     PORT: int = int(os.getenv("PORT", 8000))
-    GOOGLE_SERVICE_ACCOUNT_KEY: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
-    SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID")
+    GOOGLE_SERVICE_ACCOUNT_KEY: str
+    SHEET_ID: str
     RANGE_NAME: str = "Guides!A:C"
     ADMIN_ID: int = 6970816136
 
-config = Config()
+    def __post_init__(self):
+        koyeb_hostname = os.getenv("KOYEB_EXTERNAL_HOSTNAME")
+        if koyeb_hostname:
+            self.WEBHOOK_URL = f"https://{koyeb_hostname}{self.WEBHOOK_PATH}"
+        else:
+            logging.error("KOYEB_EXTERNAL_HOSTNAME is not set")
+            raise EnvironmentError("KOYEB_EXTERNAL_HOSTNAME is not set")
+
+# Initialize Config
+config = Config(
+    BOT_TOKEN=os.getenv("BOT_TOKEN"),
+    GOOGLE_SERVICE_ACCOUNT_KEY=os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY"),
+    SHEET_ID=os.getenv("GOOGLE_SHEET_ID")
+)
 
 # --- Validate Environment Variables ---
 def validate_env_vars():
-    required_vars = ["BOT_TOKEN", "GOOGLE_SERVICE_ACCOUNT_KEY", "SHEET_ID"]
-    missing = [var for var in required_vars if not getattr(config, var)]
+    required_vars = {
+        "BOT_TOKEN": config.BOT_TOKEN,
+        "GOOGLE_SERVICE_ACCOUNT_KEY": config.GOOGLE_SERVICE_ACCOUNT_KEY,
+        "GOOGLE_SHEET_ID": config.SHEET_ID
+    }
+    missing = [key for key, value in required_vars.items() if not value or value is None]
     if missing:
-        logging.error(f"Missing environment variables: {', '.join(missing)}")
-        raise EnvironmentError(f"Missing environment variables: {', '.join(missing)}")
+        logging.error(f"Missing or invalid environment variables: {', '.join(missing)}")
+        raise EnvironmentError(f"Missing or invalid environment variables: {', '.join(missing)}")
 
 # --- Logging Setup ---
 logging.basicConfig(filename='bot.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
