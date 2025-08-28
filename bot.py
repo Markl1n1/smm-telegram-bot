@@ -6,13 +6,16 @@ import time
 import logging
 import sqlite3
 import re
+import hashlib
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Tuple
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InputMediaVideo, InputMediaAnimation, InputMediaDocument
 )
 from aiogram.filters import Command
 from fastapi import FastAPI, Request, HTTPException
@@ -20,11 +23,11 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from cachetools import TTLCache
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 import uvicorn
 from dotenv import load_dotenv
 
-# ---------- .env для локалки ----------
+# ---------- .env для локальной отладки ----------
 load_dotenv()
 
 # ---------- Логирование ----------
@@ -38,28 +41,30 @@ def _mask(s: Optional[str], keep_tail: int = 6) -> str:
         return "None"
     return "***" + s[-keep_tail:] if len(s) > keep_tail else "***"
 
-# ---------- Конфиг (сначала без дефолтов, потом с дефолтами) ----------
+# ---------- Токен: извлечение и санитизация ----------
+TOKEN_RE = re.compile(r"\d+:[A-Za-z0-9_-]+")  # допустимый шаблон токена
+
+def clean_token(raw: str) -> Optional[str]:
+    if raw is None:
+        return None
+    s = raw.strip().strip('"').strip("'")
+    m = TOKEN_RE.search(s)
+    return m.group(0) if m else None
+
+# ---------- Конфиг (Вариант A: без дефолтов -> с дефолтами) ----------
 @dataclass
 class Config:
-    # Обязательные (без дефолта) — порядок важен
     BOT_TOKEN: str
     GOOGLE_SERVICE_ACCOUNT_KEY: str
     SHEET_ID: str
 
-    # Опциональные (с дефолтами)
     WEBHOOK_PATH: str = "/webhook"
-    WEBHOOK_URL: str = ""        # вычислим в __post_init__
+    WEBHOOK_URL: str = ""
     RANGE_NAME: str = "Guides!A:C"
     ADMIN_ID: int = 6970816136
     PORT: int = int(os.getenv("PORT", "8000"))
 
     def __post_init__(self):
-        """
-        Вычисляем публичный URL:
-        1) PUBLIC_URL, если задан (рекомендуется на Koyeb: https://{{KOYEB_PUBLIC_DOMAIN}})
-        2) KOYEB_PUBLIC_DOMAIN -> https://<domain>
-        3) KOYEB_EXTERNAL_HOSTNAME (исторический вариант в некоторых билдапах)
-        """
         public_url = os.getenv("PUBLIC_URL")
         if not public_url:
             domain = os.getenv("KOYEB_PUBLIC_DOMAIN") or os.getenv("KOYEB_EXTERNAL_HOSTNAME")
@@ -72,28 +77,26 @@ class Config:
             )
         self.WEBHOOK_URL = f"{public_url}{self.WEBHOOK_PATH}"
 
-# --- Читаем окружение с алиасами имён ---
-# допускаем и BOT_TOKEN, и TELEGRAM_BOT_TOKEN
-_bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("SHEET_ID")  # допускаем оба варианта
+# --- Читаем окружение с алиасами имён и чистим токен ---
+_raw_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+_bot_token = clean_token(_raw_token)
+_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("SHEET_ID")
 _gsak = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
 
-# Печатаем безопасную диагностику
-logging.info(f"BOT_TOKEN: {_mask(_bot_token)}")
+logging.info(f"BOT_TOKEN: {_mask(_bot_token)} (len={len(_bot_token) if _bot_token else 0})")
 logging.info(f"GOOGLE_SHEET_ID: {bool(_sheet_id)}")
 logging.info(f"GOOGLE_SERVICE_ACCOUNT_KEY set: {bool(_gsak)}")
 logging.info(f"KOYEB_PUBLIC_DOMAIN: {os.getenv('KOYEB_PUBLIC_DOMAIN')}")
 logging.info(f"PUBLIC_URL: {os.getenv('PUBLIC_URL')}")
 logging.info(f"PORT: {os.getenv('PORT')}")
 
-# Создаём конфиг (порядок полей соблюдён: без дефолта — первыми)
 config = Config(
     BOT_TOKEN=_bot_token,
     GOOGLE_SERVICE_ACCOUNT_KEY=_gsak,
     SHEET_ID=_sheet_id,
 )
 
-# --- Глобальные объекты, которые инициализируем на старте приложения ---
+# --- Глобальные объекты (инициализируем в startup) ---
 bot: Optional[Bot] = None
 dp = Dispatcher()
 app = FastAPI()
@@ -106,15 +109,24 @@ CREDS = None
 SHEETS_SERVICE = None
 DRIVE_SERVICE = None
 
-# --- Стейты и кэш ---
-main_buttons: list[str] = []
-submenus: dict[str, list[str]] = {}
+# --- Данные/кэш ---
+main_buttons: List[str] = []
+submenus: dict[str, List[str]] = {}
 texts: dict[str, str] = {}
 main_menu = None
 last_modified_time = None
 cache = TTLCache(maxsize=1, ttl=300)  # 5 минут
 rate_limit = defaultdict(list)
 last_messages: dict[int, list[int]] = {}
+
+# --- Короткие callback_data (<=64 байт) ---
+# mapping: token -> кнопка
+cb_map: dict[str, str] = {}
+
+def make_cb_token(parent: str, btn: str) -> str:
+    raw = f"{parent}|{btn}"
+    token = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:32]  # 32 символа
+    return f"sub:{token}"
 
 # --- SQLite для сессий ---
 def init_db():
@@ -139,17 +151,138 @@ async def grant_access(user_id: int):
     conn.close()
     logging.info(f"Гостевой доступ {user_id} до {time.ctime(expiry)}")
 
-# --- Проверка окружения ---
+# --- Проверка окружения и токена ---
 def validate_env_vars():
     missing = []
     if not config.BOT_TOKEN:
-        missing.append("BOT_TOKEN (или TELEGRAM_BOT_TOKEN)")
+        missing.append("BOT_TOKEN (или TELEGRAM_BOT_TOKEN) — строка вида 123456789:ABC...")
     if not config.GOOGLE_SERVICE_ACCOUNT_KEY:
-        missing.append("GOOGLE_SERVICE_ACCOUNT_KEY")
+        missing.append("GOOGLE_SERVICE_ACCOUNT_KEY (весь JSON сервис-аккаунта одной строкой)")
     if not config.SHEET_ID:
         missing.append("GOOGLE_SHEET_ID (или SHEET_ID)")
     if missing:
-        raise EnvironmentError("Отсутствуют переменные окружения: " + ", ".join(missing))
+        raise EnvironmentError("Отсутствуют/некорректны переменные окружения: " + ", ".join(missing))
+
+# --- Утилиты для ссылок и отправки медиа ---
+URL_RE = re.compile(
+    r'https?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+)
+
+PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTS = {".mp4"}  # .mov лучше избегать — не всегда поддерживается
+ANIM_EXTS  = {".gif"}
+DOC_EXTS   = {".pdf", ".svg"}
+
+def extract_urls_ordered(text: str) -> List[str]:
+    """Достаёт URL в порядке появления + дедупликация (stable)."""
+    urls = URL_RE.findall(text or "")
+    seen = OrderedDict()
+    for u in urls:
+        seen.setdefault(u, True)
+    return list(seen.keys())
+
+def ext_of(url: str) -> str:
+    """Расширение без query/fragment в нижнем регистре."""
+    path = urlparse(url).path
+    ext = os.path.splitext(path)[1].lower()
+    return ext
+
+def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str]]:
+    """
+    Разделяет ссылки на:
+    - media_items (Photo/Video/Animation) — пойдут в send_media_group
+    - docs (PDF/SVG/прочие) — отправим отдельно как документы
+    Возвращает не более 10 media для альбома (Telegram лимит).
+    """
+    media_items: List[types.InputMedia] = []
+    docs: List[str] = []
+    for url in urls:
+        e = ext_of(url)
+        if e in PHOTO_EXTS:
+            media_items.append(InputMediaPhoto(media=url))
+        elif e in VIDEO_EXTS:
+            media_items.append(InputMediaVideo(media=url))
+        elif e in ANIM_EXTS:
+            media_items.append(InputMediaAnimation(media=url))
+        elif e in DOC_EXTS:
+            docs.append(url)
+        else:
+            # неизвестное — лучше как документ, чтобы не ронять альбом
+            docs.append(url)
+    return media_items[:10], docs  # альбом максимум 10
+
+async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
+    """
+    Отправляет:
+    1) альбом медиa (до 10);
+    2) документы по очереди;
+    3) текст без ссылок;
+    4) служебное сообщение с клавиатурой (если в пункте 3 текст не отправляли).
+    Возвращает список message_id отправленных сообщений.
+    """
+    sent_ids: List[int] = []
+    urls = extract_urls_ordered(guide_text)
+    media, docs = split_media(urls)
+
+    # 1) Альбом
+    if len(media) == 1:
+        # одиночное фото/видео/гиф как отдельное сообщение
+        item = media[0]
+        try:
+            if isinstance(item, InputMediaPhoto):
+                msg = await bot.send_photo(chat_id, item.media)
+            elif isinstance(item, InputMediaVideo):
+                msg = await bot.send_video(chat_id, item.media)
+            elif isinstance(item, InputMediaAnimation):
+                msg = await bot.send_animation(chat_id, item.media)
+            else:
+                msg = await bot.send_document(chat_id, item.media)
+            sent_ids.append(msg.message_id)
+        except Exception as e:
+            logging.error(f"send single media failed: {e}")
+    elif len(media) > 1:
+        try:
+            group = await bot.send_media_group(chat_id=chat_id, media=media)
+            sent_ids.extend([m.message_id for m in group])
+        except Exception as e:
+            logging.error(f"send_media_group failed: {e}")
+            # fallback — попробуем по одному
+            for item in media:
+                try:
+                    if isinstance(item, InputMediaPhoto):
+                        msg = await bot.send_photo(chat_id, item.media)
+                    elif isinstance(item, InputMediaVideo):
+                        msg = await bot.send_video(chat_id, item.media)
+                    elif isinstance(item, InputMediaAnimation):
+                        msg = await bot.send_animation(chat_id, item.media)
+                    else:
+                        msg = await bot.send_document(chat_id, item.media)
+                    sent_ids.append(msg.message_id)
+                    await asyncio.sleep(0.3)
+                except Exception as e2:
+                    logging.error(f"fallback single media failed: {e2}")
+
+    # 2) Документы
+    # (не в альбоме; отправляем отдельными сообщениями)
+    for durl in docs[:10]:  # не будем спамить слишком много
+        try:
+            msg = await bot.send_document(chat_id, durl)
+            sent_ids.append(msg.message_id)
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            logging.error(f"send_document failed: {e}")
+
+    # 3) Текст без ссылок
+    text_without_urls = URL_RE.sub("", guide_text).strip()
+    if text_without_urls:
+        msg = await bot.send_message(chat_id, text_without_urls, reply_markup=main_menu)
+        sent_ids.append(msg.message_id)
+    else:
+        # 4) Если текста нет — служебное сообщение с клавиатурой, чтобы меню не пропадало
+        msg = await bot.send_message(chat_id, "Выберите следующий раздел:", reply_markup=main_menu)
+        sent_ids.append(msg.message_id)
+
+    return sent_ids
 
 # --- Загрузка данных из Google Sheets ---
 def sanitize_text(text: str, sanitize=True) -> str:
@@ -158,10 +291,10 @@ def sanitize_text(text: str, sanitize=True) -> str:
     return text.strip()[:100]
 
 async def load_guides(force=False):
-    global main_buttons, submenus, texts, main_menu, last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE
+    global main_buttons, submenus, texts, main_menu, last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE, cb_map
     cache_key = "guides_data"
     if cache.get(cache_key) and not force:
-        main_buttons, submenus, texts, main_menu = cache[cache_key]
+        main_buttons, submenus, texts, main_menu, cb_map = cache[cache_key]
         return
 
     if not SHEETS_SERVICE or not DRIVE_SERVICE:
@@ -187,23 +320,30 @@ async def load_guides(force=False):
                 return
             if len(values[0]) < 3 or values[0][1].lower() == "button":
                 values = values[1:]
+
             main_buttons = []
             submenus = {}
             texts = {}
+            cb_map = {}
+
             for row in values:
                 if len(row) < 3:
                     continue
                 parent = sanitize_text(row[0], sanitize=False) if row[0] else None
                 button = sanitize_text(row[1], sanitize=False)
-                text = sanitize_text(row[2], sanitize=False) if row[2] else "Текст не найден в Google Sheets."
+                text = (row[2] or "").strip() or "Текст не найден в Google Sheets."
                 texts[button] = text
                 if not parent:
                     main_buttons.append(button)
                 else:
                     submenus.setdefault(parent, []).append(button)
+
+            # Reply Keyboard
             buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
-            cache[cache_key] = (main_buttons, submenus, texts, main_menu)
+
+            cache[cache_key] = (main_buttons, submenus, texts, main_menu, cb_map)
+            logging.info(f"Guides loaded: {len(main_buttons)} main buttons, {sum(len(v) for v in submenus.values())} sub buttons")
             return
         except HttpError as e:
             if e.resp.status == 429:
@@ -221,16 +361,20 @@ async def load_guides(force=False):
                 break
             await asyncio.sleep(5 + 2 ** attempt)
 
-def build_submenu_inline(parent: str):
+def build_submenu_inline(parent: str) -> Optional[InlineKeyboardMarkup]:
     if parent not in submenus:
+        logging.info(f"No submenu found for parent='{parent}'")
         return None
     subs = submenus[parent]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for btn in subs:
-        keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=f"sub_{btn}")])
+        token = make_cb_token(parent, btn)
+        cb_map[token] = btn
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=token)])
+    logging.info(f"Built submenu for '{parent}' with {len(subs)} items")
     return keyboard
 
-# --- Удаление сообщений-«хвостов» ---
+# --- Управление сообщениями ---
 async def clear_old_messages(message_or_callback: types.Message | types.CallbackQuery):
     user_id = message_or_callback.from_user.id
     current_message_id = (
@@ -241,15 +385,15 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
         try:
             last_message_id = last_messages[user_id][-1]
             await bot.delete_message(user_id, last_message_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.debug(f"Failed to delete last message {last_message_id}: {e}")
         last_messages[user_id] = []
     try:
         await bot.delete_message(user_id, current_message_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug(f"Failed to delete triggering message {current_message_id}: {e}")
 
-# --- Периодическая перезагрузка данных ---
+# --- Периодическая перезагрузка из таблицы ---
 async def periodic_reload():
     global last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE
     while True:
@@ -263,7 +407,6 @@ async def periodic_reload():
                 last_modified_time = current_modified_time
             else:
                 logging.warning("DRIVE_SERVICE or SHEET_ID not available, skipping reload")
-                # Попытка реинициализации клиентов
                 try:
                     creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
                     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
@@ -351,53 +494,21 @@ async def main_handler(message: types.Message):
                 await bot.delete_message(user_id, message.message_id)
             except Exception:
                 pass
-        else:
-            sent = await message.answer("Неверный код доступа. Введите код доступа.")
-            sent_messages.append(sent.message_id)
     else:
         if txt in main_buttons:
+            # Пытаемся отправить подменю (inline)
             if txt in submenus:
                 submenu = build_submenu_inline(txt)
                 if submenu:
                     sent = await message.answer(f"Выберите опцию для {txt}:", reply_markup=submenu)
                     sent_messages.append(sent.message_id)
                 else:
-                    sent = await message.answer(f"Ошибка: Подменю для {txt} не найдено.", reply_markup=main_menu)
+                    sent = await message.answer(f"Подменю для {txt} не найдено.", reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
-                urls = re.findall(
-                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-                    guide_text
-                )
-                image_exts = ('.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif')
-                image_urls = [url for url in urls if url.lower().endswith(image_exts)]
-                max_retries = 2
-                if image_urls:
-                    media = [InputMediaPhoto(media=url) for url in image_urls]
-                    for attempt in range(max_retries + 1):
-                        try:
-                            sent_group = await bot.send_media_group(chat_id=user_id, media=media)
-                            sent_messages.extend([msg.message_id for msg in sent_group])
-                            break
-                        except Exception:
-                            if attempt < max_retries:
-                                await asyncio.sleep(1 + 2 ** attempt)
-                            else:
-                                for url in image_urls:
-                                    try:
-                                        sent = await message.answer_photo(url, reply_markup=main_menu)
-                                        sent_messages.append(sent.message_id)
-                                        await asyncio.sleep(0.5)
-                                    except Exception:
-                                        pass
-                text_without_urls = re.sub(
-                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-                    '', guide_text
-                ).strip()
-                if text_without_urls:
-                    sent = await message.answer(text_without_urls, reply_markup=main_menu)
-                    sent_messages.append(sent.message_id)
+                sent_ids = await send_album_and_text(user_id, guide_text)
+                sent_messages.extend(sent_ids)
         else:
             sent = await message.answer("Пожалуйста, используйте кнопки ⬇️", reply_markup=main_menu)
             sent_messages.append(sent.message_id)
@@ -407,6 +518,8 @@ async def main_handler(message: types.Message):
 @dp.callback_query()
 async def process_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    data = callback.data or ""
+    logging.info(f"Callback received from {user_id}: {data}")
     rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
     if len(rate_limit[user_id]) >= 10:
         await callback.message.answer("Слишком много запросов. Попробуйте позже.")
@@ -420,60 +533,37 @@ async def process_callback(callback: types.CallbackQuery):
         return
 
     await clear_old_messages(callback)
-    data = callback.data
-    max_retries = 2
-    for attempt in range(max_retries + 1):
-        try:
-            if data.startswith("sub_"):
-                subbutton = data[4:]
-                guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
-                sent_messages: list[int] = []
-                urls = re.findall(
-                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-                    guide_text
-                )
-                image_exts = ('.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif')
-                image_urls = [url for url in urls if url.lower().endswith(image_exts)]
-                if image_urls:
-                    media = [InputMediaPhoto(media=url) for url in image_urls]
-                    for attempt2 in range(max_retries + 1):
-                        try:
-                            sent_group = await bot.send_media_group(chat_id=user_id, media=media)
-                            sent_messages.extend([msg.message_id for msg in sent_group])
-                            break
-                        except Exception:
-                            if attempt2 < max_retries:
-                                await asyncio.sleep(1 + 2 ** attempt2)
-                            else:
-                                for url in image_urls:
-                                    try:
-                                        sent = await callback.message.answer_photo(url, reply_markup=main_menu)
-                                        sent_messages.append(sent.message_id)
-                                        await asyncio.sleep(0.5)
-                                    except Exception:
-                                        pass
-                text_without_urls = re.sub(
-                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
-                    '', guide_text
-                ).strip()
-                if text_without_urls:
-                    sent = await callback.message.answer(text_without_urls, reply_markup=main_menu)
-                    sent_messages.append(sent.message_id)
-                last_messages[user_id] = sent_messages
-            await callback.answer()
-            break
-        except Exception:
-            if attempt < max_retries:
-                await asyncio.sleep(1 + 2 ** attempt)
-            else:
-                await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
-                await callback.answer()
 
-# --- Webhook FastAPI ---
+    try:
+        if data.startswith("sub:"):
+            btn = cb_map.get(data)
+            if not btn:
+                logging.warning(f"Unknown callback token: {data}. Known tokens: {len(cb_map)}")
+                await callback.message.answer("Элемент не найден. Обновите меню (/reload).", reply_markup=main_menu)
+                await callback.answer()
+                return
+            guide_text = texts.get(btn, "Текст не найден в Google Sheets.").strip()
+            sent_ids = await send_album_and_text(user_id, guide_text)
+            last_messages[user_id] = sent_ids
+        else:
+            logging.warning(f"Unexpected callback data: {data}")
+            msg = await callback.message.answer("Некорректная кнопка. Попробуйте снова.", reply_markup=main_menu)
+            last_messages[user_id] = [msg.message_id]
+
+        await callback.answer()
+    except Exception as e:
+        logging.error(f"Callback processing error: {e}")
+        await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
+        await callback.answer()
+
+# ---------- Веб сервер ----------
 @app.post(config.WEBHOOK_PATH)
 async def webhook_handler(request: Request):
     try:
         update = await request.json()
+        # Логируем тип апдейта для диагностики
+        up_type = "callback_query" if "callback_query" in update else "message" if "message" in update else list(update.keys())
+        logging.debug(f"Incoming update type: {up_type}")
         if 'message' in update or 'callback_query' in update:
             asyncio.create_task(dp.feed_update(bot, types.Update(**update)))
         return {"ok": True}
@@ -487,18 +577,25 @@ async def health_check():
         raise HTTPException(status_code=503, detail="Google services unavailable")
     return {"status": "healthy"}
 
-# --- Старт приложения ---
+# Диагностика окружения (без утечек)
+@app.get("/debug/env")
+async def debug_env():
+    return {
+        "bot_token_present": bool(config.BOT_TOKEN),
+        "bot_token_len": len(config.BOT_TOKEN) if config.BOT_TOKEN else 0,
+        "sheet_id_present": bool(config.SHEET_ID),
+        "gsak_present": bool(config.GOOGLE_SERVICE_ACCOUNT_KEY),
+        "webhook_url": config.WEBHOOK_URL,
+    }
+
+# ---------- Старт приложения ----------
 @app.on_event("startup")
 async def on_startup():
     global bot, CREDS, SHEETS_SERVICE, DRIVE_SERVICE, last_modified_time
 
-    # 1) Проверяем окружение (упадём с понятной ошибкой, а не в aiogram)
     validate_env_vars()
-
-    # 2) Создаём Bot только после валидации
     bot = Bot(token=config.BOT_TOKEN)
 
-    # 3) Инициализируем Google-клиентов
     try:
         creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
     except json.JSONDecodeError as e:
@@ -507,19 +604,15 @@ async def on_startup():
     SHEETS_SERVICE = build("sheets", "v4", credentials=CREDS)
     DRIVE_SERVICE = build("drive", "v3", credentials=CREDS)
 
-    # 4) Поднимаем БД и вебхук
     init_db()
     last_modified_time = None
-    # Устанавливаем вебхук (повторные вызовы идемпотентны)
     await bot.set_webhook(config.WEBHOOK_URL)
     logging.info(f"Webhook set to {config.WEBHOOK_URL}")
 
-    # 5) Первичная загрузка кнопок
     await load_guides(force=True)
     if not main_menu:
         logging.warning("Guides not loaded on startup. Service may be limited.")
 
-    # Фоновые задачи
     asyncio.create_task(keep_alive())
     asyncio.create_task(periodic_reload())
 
@@ -532,5 +625,4 @@ async def keep_alive():
         await asyncio.sleep(300)
 
 if __name__ == "__main__":
-    # Если платформа задаёт WEB_CONCURRENCY, uvicorn сам поднимет нужное число воркеров.
     uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT)
