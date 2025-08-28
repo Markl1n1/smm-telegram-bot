@@ -7,8 +7,13 @@ import logging
 import sqlite3
 import re
 from dataclasses import dataclass
+from typing import Optional
+
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+)
 from aiogram.filters import Command
 from fastapi import FastAPI, Request, HTTPException
 from google.oauth2.service_account import Credentials
@@ -19,106 +24,89 @@ from collections import defaultdict
 import uvicorn
 from dotenv import load_dotenv
 
-# Load .env file for local development
+# ---------- .env для локалки ----------
 load_dotenv()
 
-# ---------- Logging (stdout, без утечек секретов) ----------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# ---------- Логирование ----------
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-def _mask(s: str | None, keep_tail: int = 6) -> str:
+def _mask(s: Optional[str], keep_tail: int = 6) -> str:
     if not s:
         return "None"
-    if len(s) <= keep_tail:
-        return "***"
-    return f"***{s[-keep_tail:]}"
+    return "***" + s[-keep_tail:] if len(s) > keep_tail else "***"
 
-logging.info(f"BOT_TOKEN: {_mask(os.getenv('BOT_TOKEN'))}")
-logging.info(f"GOOGLE_SERVICE_ACCOUNT_KEY set: {bool(os.getenv('GOOGLE_SERVICE_ACCOUNT_KEY'))}")
-logging.info(f"GOOGLE_SHEET_ID: {os.getenv('GOOGLE_SHEET_ID')}")
-logging.info(f"KOYEB_PUBLIC_DOMAIN: {os.getenv('KOYEB_PUBLIC_DOMAIN')}")
-logging.info(f"PUBLIC_URL: {os.getenv('PUBLIC_URL')}")
-logging.info(f"PORT: {os.getenv('PORT')}")
-
-# ---------- Config ----------
+# ---------- Конфиг (сначала без дефолтов, потом с дефолтами) ----------
 @dataclass
 class Config:
-    # Требуемые поля (без дефолтов) — сначала
+    # Обязательные (без дефолта) — порядок важен
     BOT_TOKEN: str
     GOOGLE_SERVICE_ACCOUNT_KEY: str
     SHEET_ID: str
 
-    # Поля с дефолтами — после
+    # Опциональные (с дефолтами)
     WEBHOOK_PATH: str = "/webhook"
-    WEBHOOK_URL: str = ""
-    PORT: int = int(os.getenv("PORT", "8000"))
+    WEBHOOK_URL: str = ""        # вычислим в __post_init__
     RANGE_NAME: str = "Guides!A:C"
     ADMIN_ID: int = 6970816136
+    PORT: int = int(os.getenv("PORT", "8000"))
 
     def __post_init__(self):
         """
-        Строим публичный URL для вебхука:
-        - Если задан PUBLIC_URL — используем его (на Koyeb удобно задать PUBLIC_URL=https://{{KOYEB_PUBLIC_DOMAIN}})
-        - Иначе пробуем KOYEB_PUBLIC_DOMAIN -> https://<domain>
-        - Иначе — падаем с понятной ошибкой.
+        Вычисляем публичный URL:
+        1) PUBLIC_URL, если задан (рекомендуется на Koyeb: https://{{KOYEB_PUBLIC_DOMAIN}})
+        2) KOYEB_PUBLIC_DOMAIN -> https://<domain>
+        3) KOYEB_EXTERNAL_HOSTNAME (исторический вариант в некоторых билдапах)
         """
         public_url = os.getenv("PUBLIC_URL")
         if not public_url:
-            public_domain = os.getenv("KOYEB_PUBLIC_DOMAIN")
-            if public_domain:
-                public_url = f"https://{public_domain}"
-        if public_url:
-            self.WEBHOOK_URL = f"{public_url}{self.WEBHOOK_PATH}"
-            logging.info(f"WEBHOOK_URL resolved to: {self.WEBHOOK_URL}")
-        else:
-            logging.error("Neither PUBLIC_URL nor KOYEB_PUBLIC_DOMAIN is set.")
+            domain = os.getenv("KOYEB_PUBLIC_DOMAIN") or os.getenv("KOYEB_EXTERNAL_HOSTNAME")
+            if domain:
+                public_url = f"https://{domain}"
+        if not public_url:
             raise EnvironmentError(
-                "Set PUBLIC_URL (e.g. https://{{KOYEB_PUBLIC_DOMAIN}} in Koyeb) or KOYEB_PUBLIC_DOMAIN"
+                "Не задан PUBLIC_URL и нет KOYEB_PUBLIC_DOMAIN/KOYEB_EXTERNAL_HOSTNAME. "
+                "Добавь PUBLIC_URL = https://{{KOYEB_PUBLIC_DOMAIN}} в переменные окружения."
             )
+        self.WEBHOOK_URL = f"{public_url}{self.WEBHOOK_PATH}"
 
-# Initialize Config (исправленный порядок полей — см. выше)
+# --- Читаем окружение с алиасами имён ---
+# допускаем и BOT_TOKEN, и TELEGRAM_BOT_TOKEN
+_bot_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("SHEET_ID")  # допускаем оба варианта
+_gsak = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
+
+# Печатаем безопасную диагностику
+logging.info(f"BOT_TOKEN: {_mask(_bot_token)}")
+logging.info(f"GOOGLE_SHEET_ID: {bool(_sheet_id)}")
+logging.info(f"GOOGLE_SERVICE_ACCOUNT_KEY set: {bool(_gsak)}")
+logging.info(f"KOYEB_PUBLIC_DOMAIN: {os.getenv('KOYEB_PUBLIC_DOMAIN')}")
+logging.info(f"PUBLIC_URL: {os.getenv('PUBLIC_URL')}")
+logging.info(f"PORT: {os.getenv('PORT')}")
+
+# Создаём конфиг (порядок полей соблюдён: без дефолта — первыми)
 config = Config(
-    BOT_TOKEN=os.getenv("BOT_TOKEN"),
-    GOOGLE_SERVICE_ACCOUNT_KEY=os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY"),
-    SHEET_ID=os.getenv("GOOGLE_SHEET_ID"),
+    BOT_TOKEN=_bot_token,
+    GOOGLE_SERVICE_ACCOUNT_KEY=_gsak,
+    SHEET_ID=_sheet_id,
 )
 
-# --- Validate Environment Variables ---
-def validate_env_vars():
-    required_vars = {
-        "BOT_TOKEN": config.BOT_TOKEN,
-        "GOOGLE_SERVICE_ACCOUNT_KEY": config.GOOGLE_SERVICE_ACCOUNT_KEY,
-        "GOOGLE_SHEET_ID": config.SHEET_ID,
-    }
-    missing = [key for key, value in required_vars.items() if not value]
-    if missing:
-        logging.error(f"Missing/invalid env vars: {', '.join(missing)}")
-        raise EnvironmentError(f"Missing or invalid environment variables: {', '.join(missing)}")
-
-# --- Bot and FastAPI Setup ---
-bot = Bot(token=config.BOT_TOKEN)
+# --- Глобальные объекты, которые инициализируем на старте приложения ---
+bot: Optional[Bot] = None
 dp = Dispatcher()
 app = FastAPI()
 
-# --- Google Sheets Setup ---
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 ]
-try:
-    creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
-    logging.info("GOOGLE_SERVICE_ACCOUNT_KEY parsed as JSON successfully")
-except json.JSONDecodeError as e:
-    logging.error(f"Invalid JSON in GOOGLE_SERVICE_ACCOUNT_KEY: {e}")
-    creds_info = None
+CREDS = None
+SHEETS_SERVICE = None
+DRIVE_SERVICE = None
 
-CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES) if creds_info else None
-SHEETS_SERVICE = build("sheets", "v4", credentials=CREDS) if CREDS else None
-DRIVE_SERVICE = build("drive", "v3", credentials=CREDS) if CREDS else None
-
-if not SHEETS_SERVICE or not DRIVE_SERVICE:
-    logging.critical("Google services failed to initialize")
-
-# --- Data Structures ---
+# --- Стейты и кэш ---
 main_buttons: list[str] = []
 submenus: dict[str, list[str]] = {}
 texts: dict[str, str] = {}
@@ -128,13 +116,13 @@ cache = TTLCache(maxsize=1, ttl=300)  # 5 минут
 rate_limit = defaultdict(list)
 last_messages: dict[int, list[int]] = {}
 
-# --- SQLite for User Sessions ---
+# --- SQLite для сессий ---
 def init_db():
     conn = sqlite3.connect("sessions.db")
     conn.execute("CREATE TABLE IF NOT EXISTS sessions (user_id INTEGER PRIMARY KEY, expiry REAL)")
     conn.commit()
     conn.close()
-    logging.info("SQLite database initialized")
+    logging.info("SQLite инициализирован")
 
 def has_access(user_id: int) -> bool:
     conn = sqlite3.connect("sessions.db")
@@ -149,16 +137,28 @@ async def grant_access(user_id: int):
     conn.execute("INSERT OR REPLACE INTO sessions (user_id, expiry) VALUES (?, ?)", (user_id, expiry))
     conn.commit()
     conn.close()
-    logging.info(f"Granted access to user {user_id} until {time.ctime(expiry)}")
+    logging.info(f"Гостевой доступ {user_id} до {time.ctime(expiry)}")
 
-# --- Google Sheets Data Loading ---
+# --- Проверка окружения ---
+def validate_env_vars():
+    missing = []
+    if not config.BOT_TOKEN:
+        missing.append("BOT_TOKEN (или TELEGRAM_BOT_TOKEN)")
+    if not config.GOOGLE_SERVICE_ACCOUNT_KEY:
+        missing.append("GOOGLE_SERVICE_ACCOUNT_KEY")
+    if not config.SHEET_ID:
+        missing.append("GOOGLE_SHEET_ID (или SHEET_ID)")
+    if missing:
+        raise EnvironmentError("Отсутствуют переменные окружения: " + ", ".join(missing))
+
+# --- Загрузка данных из Google Sheets ---
 def sanitize_text(text: str, sanitize=True) -> str:
     if sanitize:
         return re.sub(r"[^\w\s-]", "", text.strip())[:100]
     return text.strip()[:100]
 
 async def load_guides(force=False):
-    global main_buttons, submenus, texts, main_menu, last_modified_time
+    global main_buttons, submenus, texts, main_menu, last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE
     cache_key = "guides_data"
     if cache.get(cache_key) and not force:
         main_buttons, submenus, texts, main_menu = cache[cache_key]
@@ -183,7 +183,7 @@ async def load_guides(force=False):
             ).execute()
             values = result.get("values", [])
             if not values:
-                logging.warning(f"No data found in range {config.RANGE_NAME} of sheet {config.SHEET_ID}.")
+                logging.warning(f"No data found in range {config.RANGE_NAME}.")
                 return
             if len(values[0]) < 3 or values[0][1].lower() == "button":
                 values = values[1:]
@@ -207,15 +207,15 @@ async def load_guides(force=False):
             return
         except HttpError as e:
             if e.resp.status == 429:
-                logging.warning(f"Rate limit hit, retrying after delay: {e._get_reason()}")
+                logging.warning(f"Rate limit, retrying: {e}")
                 await asyncio.sleep(5 + 2 ** attempt)
             else:
-                logging.error(f"HTTP Error {e.resp.status} on attempt {attempt + 1}: {e._get_reason()}")
+                logging.error(f"HTTP Error {e.resp.status}: {e}")
                 if attempt == max_retries - 1:
                     main_menu = None
                     break
         except Exception as e:
-            logging.error(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
+            logging.error(f"Unexpected error: {e}")
             if attempt == max_retries - 1:
                 main_menu = None
                 break
@@ -230,7 +230,7 @@ def build_submenu_inline(parent: str):
         keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=f"sub_{btn}")])
     return keyboard
 
-# --- Message Management ---
+# --- Удаление сообщений-«хвостов» ---
 async def clear_old_messages(message_or_callback: types.Message | types.CallbackQuery):
     user_id = message_or_callback.from_user.id
     current_message_id = (
@@ -241,15 +241,15 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
         try:
             last_message_id = last_messages[user_id][-1]
             await bot.delete_message(user_id, last_message_id)
-        except Exception as e:
-            logging.debug(f"Failed to delete last message {last_message_id}: {e}")
+        except Exception:
+            pass
         last_messages[user_id] = []
     try:
         await bot.delete_message(user_id, current_message_id)
-    except Exception as e:
-        logging.debug(f"Failed to delete triggering message {current_message_id}: {e}")
+    except Exception:
+        pass
 
-# --- Periodic Reload ---
+# --- Периодическая перезагрузка данных ---
 async def periodic_reload():
     global last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE
     while True:
@@ -263,20 +263,20 @@ async def periodic_reload():
                 last_modified_time = current_modified_time
             else:
                 logging.warning("DRIVE_SERVICE or SHEET_ID not available, skipping reload")
-                if not SHEETS_SERVICE or not DRIVE_SERVICE:
-                    try:
-                        creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
-                        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-                        SHEETS_SERVICE = build("sheets", "v4", credentials=creds)
-                        DRIVE_SERVICE = build("drive", "v3", credentials=creds)
-                        logging.info("Reinitialized Google services")
-                    except Exception as e:
-                        logging.error(f"Failed to reinitialize Google services: {e}")
+                # Попытка реинициализации клиентов
+                try:
+                    creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
+                    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+                    SHEETS_SERVICE = build("sheets", "v4", credentials=creds)
+                    DRIVE_SERVICE = build("drive", "v3", credentials=creds)
+                    logging.info("Reinitialized Google services")
+                except Exception as e:
+                    logging.error(f"Reinit failed: {e}")
         except Exception as e:
             logging.error(f"Error in periodic reload: {e}")
         await asyncio.sleep(300)
 
-# --- Telegram Handlers ---
+# --- Хендлеры Telegram ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
@@ -366,8 +366,12 @@ async def main_handler(message: types.Message):
                     sent_messages.append(sent.message_id)
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
-                urls = re.findall(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', guide_text)
-                image_urls = [url for url in urls if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif'])]
+                urls = re.findall(
+                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+                    guide_text
+                )
+                image_exts = ('.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif')
+                image_urls = [url for url in urls if url.lower().endswith(image_exts)]
                 max_retries = 2
                 if image_urls:
                     media = [InputMediaPhoto(media=url) for url in image_urls]
@@ -387,7 +391,10 @@ async def main_handler(message: types.Message):
                                         await asyncio.sleep(0.5)
                                     except Exception:
                                         pass
-                text_without_urls = re.sub(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', guide_text).strip()
+                text_without_urls = re.sub(
+                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+                    '', guide_text
+                ).strip()
                 if text_without_urls:
                     sent = await message.answer(text_without_urls, reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
@@ -421,8 +428,12 @@ async def process_callback(callback: types.CallbackQuery):
                 subbutton = data[4:]
                 guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
                 sent_messages: list[int] = []
-                urls = re.findall(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', guide_text)
-                image_urls = [url for url in urls if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif'])]
+                urls = re.findall(
+                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+                    guide_text
+                )
+                image_exts = ('.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif')
+                image_urls = [url for url in urls if url.lower().endswith(image_exts)]
                 if image_urls:
                     media = [InputMediaPhoto(media=url) for url in image_urls]
                     for attempt2 in range(max_retries + 1):
@@ -441,7 +452,10 @@ async def process_callback(callback: types.CallbackQuery):
                                         await asyncio.sleep(0.5)
                                     except Exception:
                                         pass
-                text_without_urls = re.sub(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', guide_text).strip()
+                text_without_urls = re.sub(
+                    r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+',
+                    '', guide_text
+                ).strip()
                 if text_without_urls:
                     sent = await callback.message.answer(text_without_urls, reply_markup=main_menu)
                     sent_messages.append(sent.message_id)
@@ -455,12 +469,11 @@ async def process_callback(callback: types.CallbackQuery):
                 await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
                 await callback.answer()
 
-# --- Webhook Handler ---
+# --- Webhook FastAPI ---
 @app.post(config.WEBHOOK_PATH)
 async def webhook_handler(request: Request):
     try:
         update = await request.json()
-        # В aiogram v3 корректно прокидываем Update словарём
         if 'message' in update or 'callback_query' in update:
             asyncio.create_task(dp.feed_update(bot, types.Update(**update)))
         return {"ok": True}
@@ -468,46 +481,45 @@ async def webhook_handler(request: Request):
         logging.error(f"Error processing webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- Health Check ---
 @app.get("/health")
 async def health_check():
     if not SHEETS_SERVICE or not DRIVE_SERVICE:
         raise HTTPException(status_code=503, detail="Google services unavailable")
     return {"status": "healthy"}
 
-# --- Startup Logic ---
+# --- Старт приложения ---
 @app.on_event("startup")
 async def on_startup():
-    global last_modified_time
+    global bot, CREDS, SHEETS_SERVICE, DRIVE_SERVICE, last_modified_time
+
+    # 1) Проверяем окружение (упадём с понятной ошибкой, а не в aiogram)
     validate_env_vars()
+
+    # 2) Создаём Bot только после валидации
+    bot = Bot(token=config.BOT_TOKEN)
+
+    # 3) Инициализируем Google-клиентов
+    try:
+        creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
+    except json.JSONDecodeError as e:
+        raise EnvironmentError(f"GOOGLE_SERVICE_ACCOUNT_KEY не JSON: {e}")
+    CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    SHEETS_SERVICE = build("sheets", "v4", credentials=CREDS)
+    DRIVE_SERVICE = build("drive", "v3", credentials=CREDS)
+
+    # 4) Поднимаем БД и вебхук
     init_db()
-    if not SHEETS_SERVICE or not DRIVE_SERVICE:
-        logging.critical("Google services not initialized. Shutting down.")
-        raise SystemExit("Google services initialization failed")
-
     last_modified_time = None
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            logging.info(f"Setting webhook, attempt {attempt + 1}/{max_retries}")
-            await bot.set_webhook(config.WEBHOOK_URL)
-            logging.info(f"Webhook set to {config.WEBHOOK_URL}")
-            break
-        except Exception as e:
-            logging.error(f"Failed to set webhook: {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(5 + 2 ** attempt)
+    # Устанавливаем вебхук (повторные вызовы идемпотентны)
+    await bot.set_webhook(config.WEBHOOK_URL)
+    logging.info(f"Webhook set to {config.WEBHOOK_URL}")
 
-    for attempt in range(max_retries):
-        await load_guides(force=True)
-        if main_menu:
-            break
-        logging.warning(f"Initial load failed, retrying ({attempt + 1}/3)...")
-        await asyncio.sleep(5 + 2 ** attempt)
-
+    # 5) Первичная загрузка кнопок
+    await load_guides(force=True)
     if not main_menu:
-        logging.error("Failed to load guides after retries. Service may be unstable.")
+        logging.warning("Guides not loaded on startup. Service may be limited.")
 
+    # Фоновые задачи
     asyncio.create_task(keep_alive())
     asyncio.create_task(periodic_reload())
 
@@ -516,8 +528,9 @@ async def keep_alive():
         try:
             await bot.get_me()
         except Exception as e:
-            logging.error(f"Keep-alive ping failed: {e}")
+            logging.error(f"Keep-alive failed: {e}")
         await asyncio.sleep(300)
 
 if __name__ == "__main__":
-    uvicorn.run("bot:app", host="0.0.0.0", port=int(config.PORT))
+    # Если платформа задаёт WEB_CONCURRENCY, uvicorn сам поднимет нужное число воркеров.
+    uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT)
