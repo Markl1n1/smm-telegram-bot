@@ -7,10 +7,10 @@ import sqlite3
 import re
 from dataclasses import dataclass
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, MediaGroup
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -149,7 +149,6 @@ async def load_guides(force=False):
                 parent = sanitize_text(row[0], sanitize=False) if row[0] else None
                 button = sanitize_text(row[1], sanitize=False)
                 text = sanitize_text(row[2], sanitize=False) if row[2] else "Текст не найден в Google Sheets."
-                # Log the exact text to verify integrity
                 logging.debug(f"Loaded text for button {button}: {text}")
                 texts[button] = text
                 if not parent:
@@ -217,18 +216,30 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
 
 # --- Periodic Reload ---
 async def periodic_reload():
-    global last_modified_time
+    global last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE
     while True:
-        if DRIVE_SERVICE and config.SHEET_ID:
-            try:
+        try:
+            if DRIVE_SERVICE and config.SHEET_ID:
                 file_metadata = DRIVE_SERVICE.files().get(fileId=config.SHEET_ID, fields='modifiedTime').execute()
                 current_modified_time = file_metadata.get('modifiedTime')
                 if current_modified_time and (last_modified_time is None or last_modified_time != current_modified_time):
                     logging.info(f"Change detected at {current_modified_time}. Reloading guides...")
                     await load_guides(force=True)
                 last_modified_time = current_modified_time
-            except Exception as e:
-                logging.error(f"Error checking modified time: {e}")
+            else:
+                logging.warning("DRIVE_SERVICE or SHEET_ID not available, skipping reload")
+                # Reinitialize Google services if lost
+                if not SHEETS_SERVICE or not DRIVE_SERVICE:
+                    try:
+                        creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
+                        CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+                        SHEETS_SERVICE = build('sheets', 'v4', credentials=CREDS)
+                        DRIVE_SERVICE = build('drive', 'v3', credentials=CREDS)
+                        logging.info("Reinitialized Google services")
+                    except Exception as e:
+                        logging.error(f"Failed to reinitialize Google services: {e}")
+        except Exception as e:
+            logging.error(f"Error in periodic reload: {e}")
         await asyncio.sleep(300)  # Check every 5 minutes
 
 # --- Telegram Handlers ---
@@ -336,23 +347,28 @@ async def main_handler(message: types.Message):
                     logging.debug(f"No submenu found for {txt} for user {user_id}")
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
-                # Extract and send all image URLs with delay and retries
-                max_retries = 3
+                # Extract and send all image URLs in a media group
                 urls = re.findall(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', guide_text)
                 logging.debug(f"Extracted URLs from guide_text: {urls}")
-                for url in urls:
-                    if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                        for attempt in range(max_retries + 1):
+                image_urls = [url for url in urls if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif'])]
+                if image_urls:
+                    media_group = MediaGroup()
+                    for url in image_urls[:10]:  # Limit to 10 per Telegram's restriction
+                        media_group.attach_photo(url)
+                    try:
+                        sent = await message.answer_media_group(media=media_group)
+                        sent_messages.extend([m.message_id for m in sent])
+                        logging.debug(f"Sent media group with {len(image_urls)} images to user {user_id}")
+                    except Exception as e:
+                        logging.error(f"Failed to send media group to user {user_id}: {e}")
+                        for url in image_urls:
                             try:
-                                sent = await message.answer_photo(url, reply_markup=main_menu)
+                                sent = await message.answer_photo(url)
                                 sent_messages.append(sent.message_id)
-                                logging.debug(f"Successfully sent image attachment {url} to user {user_id}")
+                                logging.debug(f"Fallback: Sent image attachment {url} to user {user_id}")
                                 await asyncio.sleep(0.5)  # Delay to avoid rate limiting
-                                break
                             except Exception as e:
-                                logging.error(f"Failed to send image {url} to user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
-                                if attempt < max_retries:
-                                    await asyncio.sleep(1 + 2 ** attempt)
+                                logging.error(f"Fallback failed for image {url} to user {user_id}: {e}")
                 # Send remaining text if any
                 text_without_urls = re.sub(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', guide_text).strip()
                 if text_without_urls:
@@ -387,28 +403,34 @@ async def process_callback(callback: types.CallbackQuery):
     max_retries = 2
     for attempt in range(max_retries + 1):
         try:
+            logging.debug(f"Processing callback data: {data}")
             if data.startswith("sub_"):
                 subbutton = data[4:]
                 logging.info(f"Processing subbutton {subbutton} for user {user_id}")
                 guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
                 sent_messages = []
-                # Extract and send all image URLs with delay and retries
-                max_retries = 3
+                # Extract and send all image URLs in a media group
                 urls = re.findall(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', guide_text)
                 logging.debug(f"Extracted URLs from guide_text for subbutton {subbutton}: {urls}")
-                for url in urls:
-                    if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif']):
-                        for attempt in range(max_retries + 1):
+                image_urls = [url for url in urls if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif'])]
+                if image_urls:
+                    media_group = MediaGroup()
+                    for url in image_urls[:10]:  # Limit to 10 per Telegram's restriction
+                        media_group.attach_photo(url)
+                    try:
+                        sent = await callback.message.answer_media_group(media=media_group)
+                        sent_messages.extend([m.message_id for m in sent])
+                        logging.debug(f"Sent media group with {len(image_urls)} images for subbutton {subbutton} to user {user_id}")
+                    except Exception as e:
+                        logging.error(f"Failed to send media group for subbutton {subbutton} to user {user_id}: {e}")
+                        for url in image_urls:
                             try:
-                                sent = await callback.message.answer_photo(url, reply_markup=main_menu)
+                                sent = await callback.message.answer_photo(url)
                                 sent_messages.append(sent.message_id)
-                                logging.debug(f"Successfully sent image attachment {url} for subbutton {subbutton} to user {user_id}")
+                                logging.debug(f"Fallback: Sent image attachment {url} for subbutton {subbutton} to user {user_id}")
                                 await asyncio.sleep(0.5)  # Delay to avoid rate limiting
-                                break
                             except Exception as e:
-                                logging.error(f"Failed to send image {url} to user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
-                                if attempt < max_retries:
-                                    await asyncio.sleep(1 + 2 ** attempt)
+                                logging.error(f"Fallback failed for image {url} for subbutton {subbutton} to user {user_id}: {e}")
                 # Send remaining text if any
                 text_without_urls = re.sub(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', guide_text).strip()
                 if text_without_urls:
@@ -443,6 +465,13 @@ async def webhook_handler(request: Request):
         logging.error(f"Error processing webhook at {time.strftime('%H:%M:%S')}: {e}")
         return {"ok": False, "error": str(e)}, 500
 
+# --- Health Check ---
+@app.get("/health")
+async def health_check():
+    if not SHEETS_SERVICE or not DRIVE_SERVICE:
+        raise HTTPException(status_code=503, detail="Google services unavailable")
+    return {"status": "healthy"}
+
 # --- Startup Logic ---
 @app.on_event("startup")
 async def on_startup():
@@ -473,7 +502,18 @@ async def on_startup():
         await asyncio.sleep(5 + 2 ** attempt)
     if not main_menu:
         logging.error("Failed to load guides after retries. Service may be unstable.")
+    # Start keep-alive ping
+    asyncio.create_task(keep_alive())
     asyncio.create_task(periodic_reload())
+
+async def keep_alive():
+    while True:
+        try:
+            await bot.get_me()
+            logging.debug("Keep-alive ping successful")
+        except Exception as e:
+            logging.error(f"Keep-alive ping failed: {e}")
+        await asyncio.sleep(300)  # Ping every 5 minutes
 
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT)
