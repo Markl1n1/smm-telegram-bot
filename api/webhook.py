@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
 
+from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
@@ -18,7 +19,6 @@ from aiogram.types import (
     InputMediaPhoto, InputMediaVideo
 )
 from aiogram.filters import Command
-from fastapi import FastAPI, Request, HTTPException
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -26,9 +26,8 @@ from cachetools import TTLCache
 from collections import OrderedDict
 from dotenv import load_dotenv
 
-# ---------- env ----------
+# ---------------------- ENV & LOGGING ----------------------
 load_dotenv()
-
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -50,13 +49,13 @@ def clean_token(raw: Optional[str]) -> Optional[str]:
     m = TOKEN_RE.search(s)
     return m.group(0) if m else None
 
-# ---------- Config ----------
+# ---------------------- CONFIG ----------------------
 @dataclass
 class Config:
     BOT_TOKEN: str
     GOOGLE_SERVICE_ACCOUNT_KEY: str
     SHEET_ID: str
-    RANGE_NAME: str = "Guides!A:C"
+    RANGE_NAME: str = "Guides!A:C"   # А, B, C: Parent | Button | Text
 
 _raw_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 config = Config(
@@ -64,11 +63,10 @@ config = Config(
     GOOGLE_SERVICE_ACCOUNT_KEY=os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY") or "",
     SHEET_ID=(os.getenv("GOOGLE_SHEET_ID") or os.getenv("SHEET_ID") or "")
 )
-
 if not config.BOT_TOKEN or not config.GOOGLE_SERVICE_ACCOUNT_KEY or not config.SHEET_ID:
     raise RuntimeError("Missing envs: BOT_TOKEN, GOOGLE_SERVICE_ACCOUNT_KEY, GOOGLE_SHEET_ID/SHEET_ID")
 
-# ---------- Globals ----------
+# ---------------------- GLOBALS ----------------------
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 app = FastAPI()
@@ -86,10 +84,10 @@ submenus: Dict[str, List[str]] = {}
 texts: Dict[str, str] = {}
 main_menu: Optional[ReplyKeyboardMarkup] = None
 
-guides_cache = TTLCache(maxsize=1, ttl=300)  # 5 минут
-sessions: Dict[int, float] = {}  # in-memory TTL 30 минут
+guides_cache = TTLCache(maxsize=1, ttl=300)   # 5 минут
+sessions: Dict[int, float] = {}               # in-memory TTL 30 минут
 
-# ---------- Utils ----------
+# ---------------------- UTILS ----------------------
 URL_RE = re.compile(r'https?://(?:[a-zA-Z0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+')
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4"}
@@ -107,7 +105,7 @@ def ext_of(url: str) -> str:
     path = urlparse(url).path
     return os.path.splitext(path)[1].lower()
 
-def split_media(urls: List[str]):
+def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str], List[str]]:
     media_items: List[types.InputMedia] = []
     anims: List[str] = []
     docs: List[str] = []
@@ -127,7 +125,6 @@ def split_media(urls: List[str]):
 
 def has_access(user_id: int) -> bool:
     now = time.time()
-    # чистим протухшие
     for u, t in list(sessions.items()):
         if t < now:
             sessions.pop(u, None)
@@ -160,17 +157,21 @@ def resolve_btn_from_cb(data: str) -> Optional[str]:
                 return k
     return None
 
-# ---------- Google clients ----------
+# ---------------------- GOOGLE CLIENTS ----------------------
 def ensure_google():
     global CREDS, SHEETS_SERVICE, DRIVE_SERVICE
     if SHEETS_SERVICE and DRIVE_SERVICE:
         return
     creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
     CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    # cache_discovery=False — чтобы не было шума и лишних файлов
     SHEETS_SERVICE = build("sheets", "v4", credentials=CREDS, cache_discovery=False)
     DRIVE_SERVICE  = build("drive",  "v3", credentials=CREDS, cache_discovery=False)
 
 async def load_guides(force=False):
+    """
+    Подтягивает кнопки/тексты из Google Sheets.
+    """
     global main_buttons, submenus, texts, main_menu
     if guides_cache.get("ok") and not force:
         return
@@ -187,6 +188,7 @@ async def load_guides(force=False):
             if not values:
                 logging.warning(f"No data found in range {config.RANGE_NAME}.")
                 return
+            # пропустим заголовок, если есть
             if len(values[0]) < 3 or values[0][1].lower() == "button":
                 values = values[1:]
 
@@ -207,6 +209,7 @@ async def load_guides(force=False):
                     submenus.setdefault(parent, []).append(button)
 
             buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]
+            # is_persistent — меню всегда доступно
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
             guides_cache["ok"] = True
@@ -215,7 +218,7 @@ async def load_guides(force=False):
 
         except HttpError as e:
             if e.resp.status == 429:
-                logging.warning(f"Rate limit, retrying: {e}")
+                logging.warning(f"Sheets rate limit, retrying: {e}")
                 await asyncio.sleep(max(5.0, delay))
                 delay = min(delay * 2, 10.0)
             else:
@@ -235,6 +238,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
     urls = extract_urls_ordered(guide_text)
     media, anims, docs = split_media(urls)
 
+    # 1) альбом фото/видео
     if len(media) == 1:
         item = media[0]
         try:
@@ -253,6 +257,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
             sent_ids.extend([m.message_id for m in group])
         except Exception as e:
             logging.error(f"send_media_group failed: {e}")
+            # fallback — по одному
             for item in media:
                 try:
                     if isinstance(item, InputMediaPhoto):
@@ -266,6 +271,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
                 except Exception as e2:
                     logging.error(f"fallback single media failed: {e2}")
 
+    # 2) gif
     for aurl in anims[:10]:
         try:
             msg = await bot.send_animation(chat_id, aurl)
@@ -274,6 +280,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
         except Exception as e:
             logging.error(f"send_animation failed: {e}")
 
+    # 3) документы
     for durl in docs[:10]:
         try:
             msg = await bot.send_document(chat_id, durl)
@@ -282,6 +289,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
         except Exception as e:
             logging.error(f"send_document failed: {e}")
 
+    # 4) текст
     text_without_urls = URL_RE.sub("", guide_text).strip()
     if text_without_urls:
         msg = await bot.send_message(chat_id, text_without_urls, reply_markup=main_menu)
@@ -290,7 +298,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
     sent_ids.append(msg.message_id)
     return sent_ids
 
-# ---------- Aiogram handlers ----------
+# ---------------------- AIOGRAM HANDLERS ----------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await load_guides()
@@ -301,6 +309,7 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("reload"))
 async def cmd_reload(message: types.Message):
+    # всем доступно: перезагружаем данные и сбрасываем сессии
     guides_cache.clear()
     await load_guides(force=True)
     reset_all_sessions()
@@ -323,6 +332,7 @@ async def main_handler(message: types.Message):
             await message.answer("Введите код доступа.")
         return
 
+    # авторизован
     if txt in main_buttons:
         if txt in submenus:
             kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -361,34 +371,30 @@ async def process_callback(callback: types.CallbackQuery):
         guide_text = texts.get(btn, "Текст не найден в Google Sheets.")
     await send_album_and_text(callback.from_user.id, guide_text.strip())
 
-# ---------- Vercel entry (ACK fast!) ----------
+# ---------------------- VERCEL ENTRY ----------------------
+# Важно: Vercel маппит /api/webhook -> ВНУТРИ функции путь "/"
+# поэтому обязательно держим POST "/".
 @app.post("/")
-@app.post("/webhook")
-async def webhook_entry(request: Request):
-    """
-    Точка входа для Vercel (через routes на /webhook).
-    Отвечаем 200 сразу и обрабатываем апдейт асинхронно,
-    чтобы Telegram не отваливался по таймауту serverless.
-    """
+async def webhook_root(request: Request):
     try:
         payload = await request.json()
-        # Лог подебажа: кто пришёл
-        utype = "callback_query" if "callback_query" in payload else "message" if "message" in payload else list(payload.keys())
-        logging.info(f"Incoming update: {utype}")
-
-        # Парсим как Update
-        update = types.Update(**payload)
-
-        # Стартуем обработку в фоне и МГНОВЕННО отвечаем 200
-        asyncio.create_task(dp.feed_update(bot, update))
+        # быстрый ACK — обрабатываем апдейт в фоне
+        asyncio.create_task(dp.feed_update(bot, types.Update(**payload)))
         return {"ok": True}
     except Exception as e:
         logging.error(f"Error processing update: {e}")
-        # Даже если ошибка — отвечаем 200, чтобы Telegram не флудил ретраями
+        # Даже при ошибке возвращаем 200, чтобы Telegram не зафлудил ретраями
         return {"ok": False}
 
-# Пинг для проверки через браузер
+# Дополнительный маршрут на всякий (если роутится на /webhook)
+@app.post("/webhook")
+async def webhook_alias(request: Request):
+    return await webhook_root(request)
+
+# Пинги для быстрой проверки через браузер
 @app.get("/")
 @app.get("/webhook")
 async def ping():
-    return {"status": "ok"}
+    return {"status": "ok",
+            "sheet": bool(config.SHEET_ID),
+            "bot_token_len": len(config.BOT_TOKEN)}
