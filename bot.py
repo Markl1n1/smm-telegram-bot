@@ -7,7 +7,7 @@ import sqlite3
 import re
 from dataclasses import dataclass
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, MediaGroup
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from fastapi import FastAPI, Request, HTTPException
@@ -23,8 +23,8 @@ import uvicorn
 class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN")
     WEBHOOK_PATH: str = "/webhook"
-    WEBHOOK_URL: str = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
-    PORT: int = int(os.getenv("PORT", 10000))
+    WEBHOOK_URL: str = f"https://{os.getenv('KOYEB_EXTERNAL_HOSTNAME')}{WEBHOOK_PATH}"
+    PORT: int = int(os.getenv("PORT", 8000))
     GOOGLE_SERVICE_ACCOUNT_KEY: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
     SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID")
     RANGE_NAME: str = "Guides!A:C"
@@ -347,28 +347,33 @@ async def main_handler(message: types.Message):
                     logging.debug(f"No submenu found for {txt} for user {user_id}")
             else:
                 guide_text = texts.get(txt, "Текст не найден в Google Sheets.").strip()
-                # Extract and send all image URLs in a media group
+                # Extract image URLs
                 urls = re.findall(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', guide_text)
                 logging.debug(f"Extracted URLs from guide_text: {urls}")
                 image_urls = [url for url in urls if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif'])]
+                max_retries = 2
                 if image_urls:
-                    media_group = MediaGroup()
-                    for url in image_urls[:10]:  # Limit to 10 per Telegram's restriction
-                        media_group.attach_photo(url)
-                    try:
-                        sent = await message.answer_media_group(media=media_group)
-                        sent_messages.extend([m.message_id for m in sent])
-                        logging.debug(f"Sent media group with {len(image_urls)} images to user {user_id}")
-                    except Exception as e:
-                        logging.error(f"Failed to send media group to user {user_id}: {e}")
-                        for url in image_urls:
-                            try:
-                                sent = await message.answer_photo(url)
-                                sent_messages.append(sent.message_id)
-                                logging.debug(f"Fallback: Sent image attachment {url} to user {user_id}")
-                                await asyncio.sleep(0.5)  # Delay to avoid rate limiting
-                            except Exception as e:
-                                logging.error(f"Fallback failed for image {url} to user {user_id}: {e}")
+                    media = [InputMediaPhoto(media=url) for url in image_urls]
+                    for attempt in range(max_retries + 1):
+                        try:
+                            sent_group = await bot.send_media_group(chat_id=user_id, media=media)
+                            sent_messages.extend([msg.message_id for msg in sent_group])
+                            logging.debug(f"Sent media group to user {user_id}: {image_urls}")
+                            break
+                        except Exception as e:
+                            logging.error(f"Failed to send media group to user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
+                            if attempt < max_retries:
+                                await asyncio.sleep(1 + 2 ** attempt)
+                            else:
+                                # Fallback to sending images individually
+                                for url in image_urls:
+                                    try:
+                                        sent = await message.answer_photo(url, reply_markup=main_menu)
+                                        sent_messages.append(sent.message_id)
+                                        logging.debug(f"Fallback: Sent image attachment {url} to user {user_id}")
+                                        await asyncio.sleep(0.5)  # Delay to avoid rate limiting
+                                    except Exception as e:
+                                        logging.error(f"Failed to send image {url} to user {user_id}: {e}")
                 # Send remaining text if any
                 text_without_urls = re.sub(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', guide_text).strip()
                 if text_without_urls:
@@ -409,28 +414,32 @@ async def process_callback(callback: types.CallbackQuery):
                 logging.info(f"Processing subbutton {subbutton} for user {user_id}")
                 guide_text = texts.get(subbutton, "Текст не найден в Google Sheets.").strip()
                 sent_messages = []
-                # Extract and send all image URLs in a media group
+                # Extract image URLs
                 urls = re.findall(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', guide_text)
                 logging.debug(f"Extracted URLs from guide_text for subbutton {subbutton}: {urls}")
                 image_urls = [url for url in urls if any(url.lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.svg', '.pdf', '.gif'])]
                 if image_urls:
-                    media_group = MediaGroup()
-                    for url in image_urls[:10]:  # Limit to 10 per Telegram's restriction
-                        media_group.attach_photo(url)
-                    try:
-                        sent = await callback.message.answer_media_group(media=media_group)
-                        sent_messages.extend([m.message_id for m in sent])
-                        logging.debug(f"Sent media group with {len(image_urls)} images for subbutton {subbutton} to user {user_id}")
-                    except Exception as e:
-                        logging.error(f"Failed to send media group for subbutton {subbutton} to user {user_id}: {e}")
-                        for url in image_urls:
-                            try:
-                                sent = await callback.message.answer_photo(url)
-                                sent_messages.append(sent.message_id)
-                                logging.debug(f"Fallback: Sent image attachment {url} for subbutton {subbutton} to user {user_id}")
-                                await asyncio.sleep(0.5)  # Delay to avoid rate limiting
-                            except Exception as e:
-                                logging.error(f"Fallback failed for image {url} for subbutton {subbutton} to user {user_id}: {e}")
+                    media = [InputMediaPhoto(media=url) for url in image_urls]
+                    for attempt in range(max_retries + 1):
+                        try:
+                            sent_group = await bot.send_media_group(chat_id=user_id, media=media)
+                            sent_messages.extend([msg.message_id for msg in sent_group])
+                            logging.debug(f"Sent media group for subbutton {subbutton} to user {user_id}: {image_urls}")
+                            break
+                        except Exception as e:
+                            logging.error(f"Failed to send media group for subbutton {subbutton} to user {user_id}, attempt {attempt + 1}/{max_retries + 1}: {e}")
+                            if attempt < max_retries:
+                                await asyncio.sleep(1 + 2 ** attempt)
+                            else:
+                                # Fallback to sending images individually
+                                for url in image_urls:
+                                    try:
+                                        sent = await callback.message.answer_photo(url, reply_markup=main_menu)
+                                        sent_messages.append(sent.message_id)
+                                        logging.debug(f"Fallback: Sent image attachment {url} for subbutton {subbutton} to user {user_id}")
+                                        await asyncio.sleep(0.5)  # Delay to avoid rate limiting
+                                    except Exception as e:
+                                        logging.error(f"Failed to send image {url} for subbutton {subbutton} to user {user_id}: {e}")
                 # Send remaining text if any
                 text_without_urls = re.sub(r'https?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', guide_text).strip()
                 if text_without_urls:
