@@ -15,9 +15,10 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, InputMediaVideo, InputMediaAnimation, InputMediaDocument
+    InputMediaPhoto, InputMediaVideo
 )
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from fastapi import FastAPI, Request, HTTPException
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -36,13 +37,18 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# приглушим болтовню сторонних библиотек
+logging.getLogger("googleapiclient.discovery").setLevel(logging.WARNING)
+logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
+logging.getLogger("aiogram.client.session").setLevel(logging.WARNING)
+
 def _mask(s: Optional[str], keep_tail: int = 6) -> str:
     if not s:
         return "None"
     return "***" + s[-keep_tail:] if len(s) > keep_tail else "***"
 
 # ---------- Токен: извлечение и санитизация ----------
-TOKEN_RE = re.compile(r"\d+:[A-Za-z0-9_-]+")  # допустимый шаблон токена
+TOKEN_RE = re.compile(r"\d+:[A-Za-z0-9_-]+")
 
 def clean_token(raw: str) -> Optional[str]:
     if raw is None:
@@ -77,7 +83,7 @@ class Config:
             )
         self.WEBHOOK_URL = f"{public_url}{self.WEBHOOK_PATH}"
 
-# --- Читаем окружение с алиасами имён и чистим токен ---
+# --- Читаем окружение (с алиасами) и чистим токен ---
 _raw_token = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 _bot_token = clean_token(_raw_token)
 _sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("SHEET_ID")
@@ -120,7 +126,6 @@ rate_limit = defaultdict(list)
 last_messages: dict[int, list[int]] = {}
 
 # --- Короткие callback_data (<=64 байт) ---
-# mapping: token -> кнопка
 cb_map: dict[str, str] = {}
 
 def make_cb_token(parent: str, btn: str) -> str:
@@ -169,9 +174,9 @@ URL_RE = re.compile(
 )
 
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
-VIDEO_EXTS = {".mp4"}  # .mov лучше избегать — не всегда поддерживается
-ANIM_EXTS  = {".gif"}
-DOC_EXTS   = {".pdf", ".svg"}
+VIDEO_EXTS = {".mp4"}            # media group поддерживает фото/видео
+ANIM_EXTS  = {".gif"}            # гиф отправим отдельно как animation
+DOC_EXTS   = {".pdf", ".svg"}    # отдельно как документы
 
 def extract_urls_ordered(text: str) -> List[str]:
     """Достаёт URL в порядке появления + дедупликация (stable)."""
@@ -187,14 +192,16 @@ def ext_of(url: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     return ext
 
-def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str]]:
+def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str], List[str]]:
     """
     Разделяет ссылки на:
-    - media_items (Photo/Video/Animation) — пойдут в send_media_group
+    - media_items (Photo/Video) — пойдут в send_media_group
+    - anims (gif) — отправим как animation по одному
     - docs (PDF/SVG/прочие) — отправим отдельно как документы
     Возвращает не более 10 media для альбома (Telegram лимит).
     """
     media_items: List[types.InputMedia] = []
+    anims: List[str] = []
     docs: List[str] = []
     for url in urls:
         e = ext_of(url)
@@ -203,38 +210,33 @@ def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str]]:
         elif e in VIDEO_EXTS:
             media_items.append(InputMediaVideo(media=url))
         elif e in ANIM_EXTS:
-            media_items.append(InputMediaAnimation(media=url))
+            anims.append(url)
         elif e in DOC_EXTS:
             docs.append(url)
         else:
-            # неизвестное — лучше как документ, чтобы не ронять альбом
             docs.append(url)
-    return media_items[:10], docs  # альбом максимум 10
+    return media_items[:10], anims, docs  # альбом максимум 10
 
 async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
     """
     Отправляет:
-    1) альбом медиa (до 10);
-    2) документы по очереди;
-    3) текст без ссылок;
-    4) служебное сообщение с клавиатурой (если в пункте 3 текст не отправляли).
-    Возвращает список message_id отправленных сообщений.
+    1) альбом медиа (до 10 фото/видео);
+    2) gif как animation по одному;
+    3) документы (pdf/svg/прочее) по одному;
+    4) текст без ссылок ИЛИ служебное сообщение с клавиатурой.
     """
     sent_ids: List[int] = []
     urls = extract_urls_ordered(guide_text)
-    media, docs = split_media(urls)
+    media, anims, docs = split_media(urls)
 
     # 1) Альбом
     if len(media) == 1:
-        # одиночное фото/видео/гиф как отдельное сообщение
         item = media[0]
         try:
             if isinstance(item, InputMediaPhoto):
                 msg = await bot.send_photo(chat_id, item.media)
             elif isinstance(item, InputMediaVideo):
                 msg = await bot.send_video(chat_id, item.media)
-            elif isinstance(item, InputMediaAnimation):
-                msg = await bot.send_animation(chat_id, item.media)
             else:
                 msg = await bot.send_document(chat_id, item.media)
             sent_ids.append(msg.message_id)
@@ -246,15 +248,13 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
             sent_ids.extend([m.message_id for m in group])
         except Exception as e:
             logging.error(f"send_media_group failed: {e}")
-            # fallback — попробуем по одному
+            # fallback — по одному
             for item in media:
                 try:
                     if isinstance(item, InputMediaPhoto):
                         msg = await bot.send_photo(chat_id, item.media)
                     elif isinstance(item, InputMediaVideo):
                         msg = await bot.send_video(chat_id, item.media)
-                    elif isinstance(item, InputMediaAnimation):
-                        msg = await bot.send_animation(chat_id, item.media)
                     else:
                         msg = await bot.send_document(chat_id, item.media)
                     sent_ids.append(msg.message_id)
@@ -262,9 +262,17 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
                 except Exception as e2:
                     logging.error(f"fallback single media failed: {e2}")
 
-    # 2) Документы
-    # (не в альбоме; отправляем отдельными сообщениями)
-    for durl in docs[:10]:  # не будем спамить слишком много
+    # 2) GIF как animation
+    for aurl in anims[:10]:
+        try:
+            msg = await bot.send_animation(chat_id, aurl)
+            sent_ids.append(msg.message_id)
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            logging.error(f"send_animation failed: {e}")
+
+    # 3) Документы
+    for durl in docs[:10]:
         try:
             msg = await bot.send_document(chat_id, durl)
             sent_ids.append(msg.message_id)
@@ -272,13 +280,12 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
         except Exception as e:
             logging.error(f"send_document failed: {e}")
 
-    # 3) Текст без ссылок
+    # 4) Текст/служебное с клавиатурой
     text_without_urls = URL_RE.sub("", guide_text).strip()
     if text_without_urls:
         msg = await bot.send_message(chat_id, text_without_urls, reply_markup=main_menu)
         sent_ids.append(msg.message_id)
     else:
-        # 4) Если текста нет — служебное сообщение с клавиатурой, чтобы меню не пропадало
         msg = await bot.send_message(chat_id, "Выберите следующий раздел:", reply_markup=main_menu)
         sent_ids.append(msg.message_id)
 
@@ -338,7 +345,6 @@ async def load_guides(force=False):
                 else:
                     submenus.setdefault(parent, []).append(button)
 
-            # Reply Keyboard
             buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
@@ -410,8 +416,8 @@ async def periodic_reload():
                 try:
                     creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
                     creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-                    SHEETS_SERVICE = build("sheets", "v4", credentials=creds)
-                    DRIVE_SERVICE = build("drive", "v3", credentials=creds)
+                    SHEETS_SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
+                    DRIVE_SERVICE  = build("drive",  "v3", credentials=creds, cache_discovery=False)
                     logging.info("Reinitialized Google services")
                 except Exception as e:
                     logging.error(f"Reinit failed: {e}")
@@ -561,7 +567,6 @@ async def process_callback(callback: types.CallbackQuery):
 async def webhook_handler(request: Request):
     try:
         update = await request.json()
-        # Логируем тип апдейта для диагностики
         up_type = "callback_query" if "callback_query" in update else "message" if "message" in update else list(update.keys())
         logging.debug(f"Incoming update type: {up_type}")
         if 'message' in update or 'callback_query' in update:
@@ -577,7 +582,6 @@ async def health_check():
         raise HTTPException(status_code=503, detail="Google services unavailable")
     return {"status": "healthy"}
 
-# Диагностика окружения (без утечек)
 @app.get("/debug/env")
 async def debug_env():
     return {
@@ -587,6 +591,39 @@ async def debug_env():
         "gsak_present": bool(config.GOOGLE_SERVICE_ACCOUNT_KEY),
         "webhook_url": config.WEBHOOK_URL,
     }
+
+# ---------- Установка вебхука с анти-спам логикой ----------
+async def ensure_webhook(bot: Bot, url: str, max_attempts: int = 5):
+    """Ставит вебхук только если он не совпадает; уважает retry_after; делает бэкофф."""
+    try:
+        info = await bot.get_webhook_info()
+        current = getattr(info, "url", "") or ""
+    except Exception as e:
+        logging.warning(f"get_webhook_info failed: {e}")
+        current = ""
+
+    if current == url:
+        logging.info("Webhook already set; skipping set_webhook")
+        return
+
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await bot.set_webhook(url)
+            logging.info(f"Webhook set to {url}")
+            return
+        except TelegramRetryAfter as e:
+            wait = float(getattr(e, "retry_after", delay))
+            logging.warning(f"set_webhook rate-limited, retrying in {wait}s (attempt {attempt}/{max_attempts})")
+            await asyncio.sleep(wait)
+        except TelegramBadRequest as e:
+            logging.error(f"set_webhook bad request: {e}")
+            raise
+        except Exception as e:
+            logging.warning(f"set_webhook attempt {attempt} failed: {e}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 10.0)
+    raise RuntimeError("Failed to set webhook after retries")
 
 # ---------- Старт приложения ----------
 @app.on_event("startup")
@@ -601,13 +638,16 @@ async def on_startup():
     except json.JSONDecodeError as e:
         raise EnvironmentError(f"GOOGLE_SERVICE_ACCOUNT_KEY не JSON: {e}")
     CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-    SHEETS_SERVICE = build("sheets", "v4", credentials=CREDS)
-    DRIVE_SERVICE = build("drive", "v3", credentials=CREDS)
+
+    # Отключаем устаревший дискавери-кэш чтобы убрать шумные логи
+    SHEETS_SERVICE = build("sheets", "v4", credentials=CREDS, cache_discovery=False)
+    DRIVE_SERVICE  = build("drive",  "v3", credentials=CREDS, cache_discovery=False)
 
     init_db()
     last_modified_time = None
-    await bot.set_webhook(config.WEBHOOK_URL)
-    logging.info(f"Webhook set to {config.WEBHOOK_URL}")
+
+    # Ставим вебхук безопасно для мультиворкеров
+    await ensure_webhook(bot, config.WEBHOOK_URL)
 
     await load_guides(force=True)
     if not main_menu:
@@ -625,4 +665,6 @@ async def keep_alive():
         await asyncio.sleep(300)
 
 if __name__ == "__main__":
-    uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT)
+    # Управляем числом воркеров через переменные окружения (по умолчанию 1)
+    workers = int(os.getenv("UVICORN_WORKERS", os.getenv("WEB_CONCURRENCY", "1")))
+    uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT, workers=workers)
