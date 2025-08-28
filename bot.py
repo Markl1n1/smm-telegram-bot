@@ -57,7 +57,7 @@ def clean_token(raw: str) -> Optional[str]:
     m = TOKEN_RE.search(s)
     return m.group(0) if m else None
 
-# ---------- Конфиг (Вариант A: без дефолтов -> с дефолтами) ----------
+# ---------- Конфиг ----------
 @dataclass
 class Config:
     BOT_TOKEN: str
@@ -71,12 +71,7 @@ class Config:
     PORT: int = int(os.getenv("PORT", "8000"))
 
     def __post_init__(self):
-        """
-        Формируем WEBHOOK_URL без жёсткой зависимости от PUBLIC_URL:
-        1) PUBLIC_URL, если есть;
-        2) KOYEB_PUBLIC_DOMAIN/KOYEB_EXTERNAL_HOSTNAME -> https://<domain>;
-        3) если ничего нет — оставляем WEBHOOK_URL пустым (вебхук ставить не будем).
-        """
+        # Формируем WEBHOOK_URL без обязательного PUBLIC_URL
         public_url = os.getenv("PUBLIC_URL")
         if not public_url:
             domain = os.getenv("KOYEB_PUBLIC_DOMAIN") or os.getenv("KOYEB_EXTERNAL_HOSTNAME")
@@ -119,13 +114,25 @@ cache = TTLCache(maxsize=1, ttl=300)  # 5 минут
 rate_limit = defaultdict(list)
 last_messages: dict[int, list[int]] = {}
 
-# --- Короткие callback_data (<=64 байт) ---
-cb_map: dict[str, str] = {}
+# --- callback_data: прямой текст, либо запасной хеш ---
+cb_map: dict[str, str] = {}  # только для случаев, когда текст не влезает в 64 байта
 
 def make_cb_token(parent: str, btn: str) -> str:
     raw = f"{parent}|{btn}"
     token = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:32]  # 32 символа
     return f"sub:{token}"
+
+def make_cb_data(parent: str, btn: str) -> str:
+    """
+    Предпочитаем человекочитаемый вариант: 'sub|<btn>' (если умещается в 64 байта).
+    Иначе используем 'sub:<hash>' и кладем соответствие в cb_map.
+    """
+    direct = f"sub|{btn}"
+    if len(direct.encode("utf-8")) <= 64:
+        return direct
+    token = make_cb_token(parent, btn)
+    cb_map[token] = btn
+    return token
 
 # --- SQLite для сессий ---
 def init_db():
@@ -150,7 +157,7 @@ async def grant_access(user_id: int):
     conn.close()
     logging.info(f"Гостевой доступ {user_id} до {time.ctime(expiry)}")
 
-# --- Проверка окружения и токена ---
+# --- Проверка окружения ---
 def validate_env_vars():
     missing = []
     if not config.BOT_TOKEN:
@@ -173,7 +180,6 @@ ANIM_EXTS  = {".gif"}            # гиф — отдельно как animation
 DOC_EXTS   = {".pdf", ".svg"}    # отдельно как документы
 
 def extract_urls_ordered(text: str) -> List[str]:
-    """Достаёт URL в порядке появления + дедупликация (stable)."""
     urls = URL_RE.findall(text or "")
     seen = OrderedDict()
     for u in urls:
@@ -181,19 +187,11 @@ def extract_urls_ordered(text: str) -> List[str]:
     return list(seen.keys())
 
 def ext_of(url: str) -> str:
-    """Расширение без query/fragment в нижнем регистре."""
     path = urlparse(url).path
     ext = os.path.splitext(path)[1].lower()
     return ext
 
 def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str], List[str]]:
-    """
-    Разделяет ссылки на:
-    - media_items (Photo/Video) — пойдут в send_media_group
-    - anims (gif) — отправим как animation по одному
-    - docs (PDF/SVG/прочие) — отправим отдельно как документы
-    Возвращает не более 10 media для альбома (Telegram лимит).
-    """
     media_items: List[types.InputMedia] = []
     anims: List[str] = []
     docs: List[str] = []
@@ -212,13 +210,6 @@ def split_media(urls: List[str]) -> Tuple[List[types.InputMedia], List[str], Lis
     return media_items[:10], anims, docs
 
 async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
-    """
-    Отправляет:
-    1) альбом медиа (до 10 фото/видео);
-    2) gif как animation по одному;
-    3) документы (pdf/svg/прочее) по одному;
-    4) текст без ссылок ИЛИ служебное сообщение с клавиатурой.
-    """
     sent_ids: List[int] = []
     urls = extract_urls_ordered(guide_text)
     media, anims, docs = split_media(urls)
@@ -242,7 +233,6 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
             sent_ids.extend([m.message_id for m in group])
         except Exception as e:
             logging.error(f"send_media_group failed: {e}")
-            # fallback — по одному
             for item in media:
                 try:
                     if isinstance(item, InputMediaPhoto):
@@ -256,7 +246,7 @@ async def send_album_and_text(chat_id: int, guide_text: str) -> List[int]:
                 except Exception as e2:
                     logging.error(f"fallback single media failed: {e2}")
 
-    # 2) GIF как animation
+    # 2) GIF
     for aurl in anims[:10]:
         try:
             msg = await bot.send_animation(chat_id, aurl)
@@ -345,7 +335,6 @@ async def load_guides(force=False):
                     submenus.setdefault(parent, []).append(button)
 
             buttons = [[KeyboardButton(text=btn)] for btn in main_buttons]
-            # is_persistent=True, чтобы клавиатура всегда была доступна
             main_menu = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, is_persistent=True)
 
             cache[cache_key] = (main_buttons, submenus, texts, main_menu, cb_map)
@@ -364,7 +353,6 @@ async def load_guides(force=False):
                     break
         except Exception as e:
             msg = str(e)
-            # трактуем как транзиентный SSL-глич — ретраим
             if isinstance(e, ssl.SSLError) or "EOF occurred" in msg or "SSLError" in type(e).__name__:
                 logging.warning(f"Transient SSL error on load_guides (attempt {attempt}/{max_retries}): {e}")
                 await asyncio.sleep(delay)
@@ -384,9 +372,10 @@ def build_submenu_inline(parent: str) -> Optional[InlineKeyboardMarkup]:
     subs = submenus[parent]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[])
     for btn in subs:
-        token = make_cb_token(parent, btn)
-        cb_map[token] = btn
-        keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=token)])
+        data = make_cb_data(parent, btn)  # sub|<btn> или sub:<hash>
+        if data.startswith("sub:"):
+            cb_map[data] = btn  # для хеша сохраняем соответствие (на всякий случай)
+        keyboard.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=data)])
     logging.info(f"Built submenu for '{parent}' with {len(subs)} items")
     return keyboard
 
@@ -512,7 +501,6 @@ async def main_handler(message: types.Message):
                 pass
     else:
         if txt in main_buttons:
-            # Пытаемся отправить подменю (inline)
             if txt in submenus:
                 submenu = build_submenu_inline(txt)
                 if submenu:
@@ -535,48 +523,56 @@ async def main_handler(message: types.Message):
 async def process_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     data = callback.data or ""
+    # мгновенно гасим «крутилку» у пользователя
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+
     logging.info(f"Callback received from {user_id}: {data}")
     rate_limit[user_id] = [t for t in rate_limit[user_id] if time.time() - t < 60]
     if len(rate_limit[user_id]) >= 10:
         await callback.message.answer("Слишком много запросов. Попробуйте позже.")
-        await callback.answer()
         return
     rate_limit[user_id].append(time.time())
 
     if not has_access(user_id):
         await callback.message.answer("Доступ истек. Введите код доступа.", reply_markup=main_menu)
-        await callback.answer()
         return
 
     await clear_old_messages(callback)
 
     try:
-        if data.startswith("sub:"):
+        btn: Optional[str] = None
+        if data.startswith("sub|"):
+            btn = data.split("|", 1)[1]  # кнопка вшита прямо в callback_data
+        elif data.startswith("sub:"):
             btn = cb_map.get(data)
-            if not btn:
-                logging.warning(f"Unknown callback token: {data}. Known tokens: {len(cb_map)}")
-                await callback.message.answer("Элемент не найден. Обновите меню (/reload).", reply_markup=main_menu)
-                await callback.answer()
-                return
-            guide_text = texts.get(btn, "Текст не найден в Google Sheets.").strip()
-            sent_ids = await send_album_and_text(user_id, guide_text)
-            last_messages[user_id] = sent_ids
-        else:
-            logging.warning(f"Unexpected callback data: {data}")
-            msg = await callback.message.answer("Некорректная кнопка. Попробуйте снова.", reply_markup=main_menu)
-            last_messages[user_id] = [msg.message_id]
 
-        await callback.answer()
+        if not btn:
+            logging.warning(f"Unknown callback data: {data}. Known tokens: {len(cb_map)}")
+            await callback.message.answer("Элемент не найден. Обновите меню (/reload).", reply_markup=main_menu)
+            return
+
+        guide_text = texts.get(btn)
+        if guide_text is None:
+            # возможно, таблица перезагрузилась — попробуем жестче
+            logging.warning(f"Button '{btn}' not found in texts; keys={len(texts)}")
+            await load_guides(force=True)
+            guide_text = texts.get(btn, "Текст не найден в Google Sheets.")
+
+        sent_ids = await send_album_and_text(user_id, guide_text.strip())
+        last_messages[user_id] = sent_ids
+
     except Exception as e:
         logging.error(f"Callback processing error: {e}")
         await callback.message.answer("Ошибка обработки. Попробуйте снова.", reply_markup=main_menu)
-        await callback.answer()
 
 # ---------- Веб сервер ----------
 @app.post(config.WEBHOOK_PATH if config.WEBHOOK_URL else "/webhook")
 async def webhook_handler(request: Request):
     """
-    Если WEBHOOK_URL пустой (не смогли собрать URL) — маршрут всё равно существует,
+    Если WEBHOOK_URL пустой — маршрут всё равно существует,
     чтобы можно было поставить вебхук вручную на <domain>/webhook.
     """
     try:
@@ -608,10 +604,6 @@ async def debug_env():
 
 # ---------- Установка вебхука с анти-спам логикой ----------
 async def ensure_webhook(bot: Bot, url: str, max_attempts: int = 5):
-    """
-    Ставит вебхук только если он не совпадает; уважает retry_after; бэкофф.
-    Если url пуст — просто логируем и выходим.
-    """
     if not url:
         logging.info("WEBHOOK_URL is empty; skipping set_webhook. You can set it manually to <domain>/webhook")
         return
@@ -651,7 +643,6 @@ async def ensure_webhook(bot: Bot, url: str, max_attempts: int = 5):
 async def on_startup():
     global bot, CREDS, SHEETS_SERVICE, DRIVE_SERVICE, last_modified_time
 
-    # Диагностика окружения (однократно, без дублей)
     logging.info(f"BOT_TOKEN: {_mask(config.BOT_TOKEN)} (len={len(config.BOT_TOKEN) if config.BOT_TOKEN else 0})")
     logging.info(f"GOOGLE_SHEET_ID: {bool(config.SHEET_ID)}")
     logging.info(f"GOOGLE_SERVICE_ACCOUNT_KEY set: {bool(config.GOOGLE_SERVICE_ACCOUNT_KEY)}")
@@ -668,14 +659,13 @@ async def on_startup():
         raise EnvironmentError(f"GOOGLE_SERVICE_ACCOUNT_KEY не JSON: {e}")
     CREDS = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
-    # Отключаем устаревший дискавери-кэш чтобы убрать шумные логи
+    # без file_cache-шума
     SHEETS_SERVICE = build("sheets", "v4", credentials=CREDS, cache_discovery=False)
     DRIVE_SERVICE  = build("drive",  "v3", credentials=CREDS, cache_discovery=False)
 
     init_db()
     last_modified_time = None
 
-    # Ставим вебхук безопасно для мультиворкеров (но мы ниже принудительно запускаем 1 воркер)
     await ensure_webhook(bot, config.WEBHOOK_URL)
 
     await load_guides(force=True)
@@ -694,5 +684,5 @@ async def keep_alive():
         await asyncio.sleep(300)
 
 if __name__ == "__main__":
-    # Принудительно 1 воркер, чтобы не было дублирования логов/инициализаций
+    # Принудительно 1 воркер — убираем дубли логов/инициализаций
     uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT, workers=1)
