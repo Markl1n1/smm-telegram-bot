@@ -552,7 +552,7 @@ async def webhook_handler(request: Request):
         logging.error(f"Error processing webhook: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
     if not SHEETS_SERVICE or not DRIVE_SERVICE or last_modified_time is None:
         raise HTTPException(status_code=503, detail="Google services unavailable or no successful guide load")
