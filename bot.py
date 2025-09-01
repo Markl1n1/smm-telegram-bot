@@ -28,6 +28,8 @@ from cachetools import TTLCache
 from collections import defaultdict, OrderedDict
 import uvicorn
 from dotenv import load_dotenv
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 # ---------- .env для локальной отладки ----------
 load_dotenv()
@@ -109,6 +111,7 @@ last_modified_time = None
 cache = TTLCache(maxsize=1, ttl=300)
 rate_limit = defaultdict(list)
 last_messages: dict[int, list[int]] = {}
+scheduler: Optional[AsyncIOScheduler] = None
 
 # ---------- Сессии доступа ----------
 def init_db():
@@ -323,18 +326,26 @@ async def load_guides(force=False):
             else:
                 logging.error(f"HTTP Error {e.resp.status}: {e}")
                 if attempt == max_retries:
-                    main_menu = None
+                    logging.error("Max retries reached; using cached data if available.")
+                    if cache.get(cache_key):
+                        main_buttons, submenus, texts, main_menu = cache[cache_key]
+                    else:
+                        main_menu = None
                     break
         except Exception as e:
             msg = str(e)
-            if isinstance(e, ssl.SSLError) or "EOF occurred" in msg or "SSLError" in type(e).__name__:
-                logging.warning(f"Transient SSL error on load_guides (attempt {attempt}/{max_retries}): {e}")
+            if isinstance(e, ssl.SSLError) or "EOF occurred" in msg or "SSLError" in type(e).__name__ or "Broken pipe" in msg:
+                logging.warning(f"Transient network error on load_guides (attempt {attempt}/{max_retries}): {e}")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 10.0)
                 continue
             logging.error(f"Unexpected error on load_guides (attempt {attempt}/{max_retries}): {e}")
             if attempt == max_retries:
-                main_menu = None
+                logging.error("Max retries reached; using cached data if available.")
+                if cache.get(cache_key):
+                    main_buttons, submenus, texts, main_menu = cache[cache_key]
+                else:
+                    main_menu = None
                 break
             await asyncio.sleep(delay)
             delay = min(delay * 2, 10.0)
@@ -351,7 +362,7 @@ def build_submenu_inline(parent: str) -> Optional[InlineKeyboardMarkup]:
         if len(direct.encode("utf-8")) <= 64:
             cb = direct
         else:
-            cb = f"sub#{hashlib.sha1(btn.encode('utf-8')).hexdigest()[:32]}"
+            cb = "sub#" + hashlib.sha1(btn.encode("utf-8")).hexdigest()[:32]  # sha1 для совместимости, но можно sha256
         kb.inline_keyboard.append([InlineKeyboardButton(text=btn, callback_data=cb)])
     logging.info(f"Built submenu for '{parent}' with {len(subs)} items")
     return kb
@@ -374,31 +385,6 @@ async def clear_old_messages(message_or_callback: types.Message | types.Callback
         await bot.delete_message(user_id, current_message_id)
     except Exception as e:
         logging.debug(f"Failed to delete triggering message {current_message_id}: {e}")
-
-async def periodic_reload():
-    global last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE
-    while True:
-        try:
-            if DRIVE_SERVICE and config.SHEET_ID:
-                file_metadata = DRIVE_SERVICE.files().get(fileId=config.SHEET_ID, fields="modifiedTime").execute()
-                current_modified_time = file_metadata.get("modifiedTime")
-                if current_modified_time and (last_modified_time is None or last_modified_time != current_modified_time):
-                    logging.info(f"Change detected at {current_modified_time}. Reloading guides...")
-                    await load_guides(force=True)
-                last_modified_time = current_modified_time
-            else:
-                logging.warning("DRIVE_SERVICE or SHEET_ID not available, skipping reload")
-                try:
-                    creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
-                    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-                    SHEETS_SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
-                    DRIVE_SERVICE  = build("drive",  "v3", credentials=creds, cache_discovery=False)
-                    logging.info("Reinitialized Google services")
-                except Exception as e:
-                    logging.error(f"Reinit failed: {e}")
-        except Exception as e:
-            logging.error(f"Error in periodic reload: {e}")
-        await asyncio.sleep(300)
 
 # ---------- Хендлеры ----------
 @dp.message(Command("start"))
@@ -568,8 +554,8 @@ async def webhook_handler(request: Request):
 
 @app.get("/health")
 async def health_check():
-    if not SHEETS_SERVICE or not DRIVE_SERVICE:
-        raise HTTPException(status_code=503, detail="Google services unavailable")
+    if not SHEETS_SERVICE or not DRIVE_SERVICE or last_modified_time is None:
+        raise HTTPException(status_code=503, detail="Google services unavailable or no successful guide load")
     return {"status": "healthy"}
 
 @app.get("/debug/env")
@@ -618,7 +604,7 @@ async def ensure_webhook(bot: Bot, url: str, max_attempts: int = 5):
 # ---------- Старт ----------
 @app.on_event("startup")
 async def on_startup():
-    global bot, CREDS, SHEETS_SERVICE, DRIVE_SERVICE, last_modified_time
+    global bot, CREDS, SHEETS_SERVICE, DRIVE_SERVICE, last_modified_time, scheduler
     logging.info(f"BOT_TOKEN: {_mask(config.BOT_TOKEN)} (len={len(config.BOT_TOKEN) if config.BOT_TOKEN else 0})")
     logging.info(f"GOOGLE_SHEET_ID: {bool(config.SHEET_ID)}")
     logging.info(f"GOOGLE_SERVICE_ACCOUNT_KEY set: {bool(config.GOOGLE_SERVICE_ACCOUNT_KEY)}")
@@ -643,20 +629,55 @@ async def on_startup():
 
     await ensure_webhook(bot, config.WEBHOOK_URL)
 
-    await load_guides(force=True)
+    try:
+        await load_guides(force=True)
+    except Exception as e:
+        logging.error(f"Failed to load guides on startup: {e}")
+
     if not main_menu:
         logging.warning("Guides not loaded on startup. Service may be limited.")
 
-    asyncio.create_task(keep_alive())
-    asyncio.create_task(periodic_reload())
-
-async def keep_alive():
-    while True:
+    # APScheduler for periodic tasks
+    scheduler = AsyncIOScheduler()
+    
+    async def single_keep_alive():
         try:
             await bot.get_me()
         except Exception as e:
             logging.error(f"Keep-alive failed: {e}")
-        await asyncio.sleep(300)
+    
+    async def single_periodic_reload():
+        global last_modified_time, SHEETS_SERVICE, DRIVE_SERVICE
+        try:
+            if DRIVE_SERVICE and config.SHEET_ID:
+                file_metadata = DRIVE_SERVICE.files().get(fileId=config.SHEET_ID, fields="modifiedTime").execute()
+                current_modified_time = file_metadata.get("modifiedTime")
+                if current_modified_time and (last_modified_time is None or last_modified_time != current_modified_time):
+                    logging.info(f"Change detected at {current_modified_time}. Reloading guides...")
+                    await load_guides(force=True)
+                last_modified_time = current_modified_time
+            else:
+                logging.warning("DRIVE_SERVICE or SHEET_ID not available, skipping reload")
+                try:
+                    creds_info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
+                    creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+                    SHEETS_SERVICE = build("sheets", "v4", credentials=creds, cache_discovery=False)
+                    DRIVE_SERVICE  = build("drive",  "v3", credentials=creds, cache_discovery=False)
+                    logging.info("Reinitialized Google services")
+                except Exception as e:
+                    logging.error(f"Reinit failed: {e}")
+        except Exception as e:
+            logging.error(f"Error in single periodic reload: {e}", exc_info=True)
+    
+    scheduler.add_job(single_keep_alive, IntervalTrigger(minutes=3))
+    scheduler.add_job(single_periodic_reload, IntervalTrigger(minutes=3))
+    scheduler.start()
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global scheduler
+    if scheduler:
+        await scheduler.shutdown()
 
 if __name__ == "__main__":
     uvicorn.run("bot:app", host="0.0.0.0", port=config.PORT, workers=1)
