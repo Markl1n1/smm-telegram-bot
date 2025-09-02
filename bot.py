@@ -376,14 +376,15 @@ async def on_shutdown():
     global scheduler, bot
     if scheduler:
         try:
-            scheduler.shutdown(wait=False)
-        except Exception:
-            pass
+            scheduler.shutdown(wait=False)  # без await
+        except Exception as e:
+            logging.warning(f"Scheduler shutdown failed: {e}")
     if bot:
         try:
             await bot.session.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Bot session close failed: {e}")
+
 
 # ---------- Health / Debug endpoints ----------
 @app.api_route("/live", methods=["GET", "HEAD"])
