@@ -180,7 +180,7 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
                 return
 
             last_modified_time = modified_time
-            result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=config.GOOGLE_SHEET_ID, range="Main!A:D").execute()
+            result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=config.GOOGLE_SHEET_ID, range="Guides!A:C").execute()
             values = result.get("values", [])
             nb: List[str] = []
             ns: Dict[str, List[str]] = {}
