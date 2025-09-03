@@ -28,8 +28,8 @@ class Config:
     GOOGLE_SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
     KOYEB_PUBLIC_DOMAIN = os.getenv("KOYEB_PUBLIC_DOMAIN")
     PORT = int(os.getenv("PORT", 8000))
-    RELOAD_MINUTES = int(os.getenv("RELOAD_MINUTES", "10"))
-    CODEWORD = os.getenv("CODEWORD", "infobot")  # кодовое слово
+    RELOAD_MINUTES = int(os.getenv("RELOAD_MINUTES", "60"))
+    CODEWORD = os.getenv("CODEWORD", "infobot")
 
     @property
     def WEBHOOK_URL(self) -> Optional[str]:
@@ -63,10 +63,10 @@ is_started = False
 is_ready = False
 first_ready_deadline: Optional[float] = None
 
-# ---- Auth (в памяти) ----
+# ---- Auth ----
 AUTH_TTL = 24 * 60 * 60  # 24 часа
-auth_sessions: Dict[int, float] = {}  # user_id -> expires_at
-awaiting_code: Set[int] = set()       # ждём код после /start
+auth_sessions: Dict[int, float] = {}
+awaiting_code: Set[int] = set()
 
 def is_authed(user_id: int) -> bool:
     exp = auth_sessions.get(user_id, 0)
@@ -75,15 +75,15 @@ def is_authed(user_id: int) -> bool:
 def grant_auth(user_id: int):
     auth_sessions[user_id] = time.time() + AUTH_TTL
 
-# ---------- Хелперы сообщений / зачистка истории ----------
-chat_msgs: Dict[int, List[int]] = {}  # chat_id -> [message_ids]
+# ---------- Хелперы сообщений / Очистка ----------
+chat_msgs: Dict[int, List[int]] = {}
 
 def _remember_msg(chat_id: int, message_id: int):
     arr = chat_msgs.setdefault(chat_id, [])
     if message_id not in arr:
         arr.append(message_id)
-        if len(arr) > 200:
-            del arr[:-200]
+        if len(arr) > 20:
+            del arr[:-20]
 
 async def purge_chat(chat_id: int):
     ids = chat_msgs.get(chat_id, [])
@@ -229,8 +229,6 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
             ns: Dict[str, List[str]] = {}
             nt: Dict[str, str] = {}
 
-            # 1) A пусто, B=Button, C=Text  -> пункт меню с текстом
-            # 2) A=Parent, B=Sub, C=Text    -> сабменю родителя A
             for row in values[1:]:
                 parent = row[0].strip() if len(row) > 0 and row[0] else ""
                 btn    = row[1].strip() if len(row) > 1 and row[1] else ""
@@ -251,7 +249,6 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
                     if btn and text:
                         nt[btn] = text
 
-            # rebuild callback id maps for subbuttons
             cb_id_to_key.clear()
             key_to_cb_id.clear()
             for items in ns.values():
@@ -293,7 +290,6 @@ def extract_image_urls(text: str) -> List[str]:
     for token in re.split(r"[\s,;\n]+", text.strip()):
         if token.lower().endswith(IMG_EXTS) and token.startswith(("http://", "https://")):
             urls.append(token)
-    # remove duplicates, keep order
     seen = set()
     uniq = []
     for u in urls:
@@ -303,10 +299,6 @@ def extract_image_urls(text: str) -> List[str]:
     return uniq[:10]  # Telegram альбом до 10 фото
 
 async def send_content_with_menu(chat_id: int, content_text: str):
-    """
-    Отправляет либо просто текст (с клавиатурой меню),
-    либо 1 фото, либо альбом изображений, после чего всегда — сообщение с меню.
-    """
     urls = extract_image_urls(content_text)
     if urls:
         if len(urls) == 1:
@@ -317,7 +309,6 @@ async def send_content_with_menu(chat_id: int, content_text: str):
             msgs = await bot.send_media_group(chat_id, media=media)
             for m in msgs:
                 _remember_msg(chat_id, m.message_id)
-        # Всегда отдельное сообщение, чтобы прикрепить reply-клавиатуру
         m2 = await bot.send_message(chat_id, "Выберите опцию:", reply_markup=main_menu_kb())
         _remember_msg(chat_id, m2.message_id)
     else:
@@ -384,7 +375,6 @@ async def text_handler(message: types.Message):
     incoming = (message.text or "").strip()
     _remember_msg(chat_id, message.message_id)
 
-    # кодовая фаза
     if (user_id in awaiting_code) or (not is_authed(user_id)):
         if incoming.lower() == config.CODEWORD.lower():
             awaiting_code.discard(user_id)
@@ -396,7 +386,6 @@ async def text_handler(message: types.Message):
             _remember_msg(chat_id, m.message_id)
         return
 
-    # меню/сабменю
     if incoming in main_buttons:
         items = submenus.get(incoming, [])
         if items:
@@ -514,12 +503,8 @@ async def on_startup():
         except Exception as e:
             logging.error(f"Periodic reload failed: {e}")
 
-    logging.info("Adding job tentatively -- it will be properly scheduled when the scheduler starts")
     scheduler.add_job(single_keep_alive, "interval", minutes=5, id="keep_alive", replace_existing=True)
-    logging.info("Adding job tentatively -- it will be properly scheduled when the scheduler starts")
     scheduler.add_job(single_periodic_reload, "interval", minutes=config.RELOAD_MINUTES, id="periodic_reload", replace_existing=True)
-    logging.info('Added job "on_startup.<locals>.single_keep_alive" to job store "default"')
-    logging.info('Added job "on_startup.<locals>.single_periodic_reload" to job store "default"')
     scheduler.start()
     logging.info("Scheduler started")
     logging.info("Scheduler started and app startup complete")
