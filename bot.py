@@ -26,13 +26,10 @@ class Config:
     GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
     GOOGLE_SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
     KOYEB_PUBLIC_DOMAIN = os.getenv("KOYEB_PUBLIC_DOMAIN")
-    PUBLIC_URL = os.getenv("PUBLIC_URL")
     PORT = int(os.getenv("PORT", 8000))
 
     @property
     def WEBHOOK_URL(self) -> Optional[str]:
-        if self.PUBLIC_URL:
-            return f"{self.PUBLIC_URL}/webhook"
         if self.KOYEB_PUBLIC_DOMAIN:
             return f"https://{self.KOYEB_PUBLIC_DOMAIN}/webhook"
         return None
