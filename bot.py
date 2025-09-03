@@ -60,7 +60,6 @@ is_started = False
 is_ready = False
 first_ready_deadline: Optional[float] = None
 
-# ---------- Utilities ----------
 def _mask(s: Optional[str]) -> str:
     if not s:
         return "(empty)"
@@ -73,38 +72,44 @@ def get_sqlite_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+# ---------- Callback data helpers ----------
+cb_id_to_key: Dict[str, str] = {}
+key_to_cb_id: Dict[str, str] = {}
+
+def _safe_label(s: str, limit: int = 64) -> str:
+    try:
+        return (s[:limit-1] + "…") if len(s) > limit else s
+    except Exception:
+        return s
+
+def _cb_for(key: str) -> str:
+    cid = key_to_cb_id.get(key)
+    if cid:
+        return cid
+    cid = f"s{len(key_to_cb_id)}"
+    key_to_cb_id[key] = cid
+    cb_id_to_key[cid] = key
+    return cid
+
 # ---------- SQLite ----------
 def init_sqlite():
     conn = get_sqlite_conn()
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_seen INTEGER
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            user_id INTEGER PRIMARY KEY,
-            expiry INTEGER
-        )
-    """)
-    cur.execute("""
         CREATE TABLE IF NOT EXISTS guides_cache (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cached_at INTEGER,
-            payload TEXT
+            payload TEXT NOT NULL,
+            cached_at INTEGER NOT NULL
         )
     """)
     conn.commit()
     conn.close()
     logging.info("SQLite инициализирован")
 
-def save_guides_to_cache(payload: dict):
+def cache_guides(payload: dict):
     conn = get_sqlite_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO guides_cache (cached_at, payload) VALUES (?, ?)", (int(time.time()), json.dumps(payload, ensure_ascii=False)))
+    cur.execute("INSERT INTO guides_cache(payload, cached_at) VALUES (?, ?)", (json.dumps(payload, ensure_ascii=False), int(time.time())))
     conn.commit()
     conn.close()
     logging.info("Guides cached to SQLite")
@@ -180,33 +185,45 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
                 return
 
             last_modified_time = modified_time
-            result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=config.GOOGLE_SHEET_ID, range="Guides!A:C").execute()
+            result = SHEETS_SERVICE.spreadsheets().values().get(
+                spreadsheetId=config.GOOGLE_SHEET_ID,
+                range=os.getenv("GOOGLE_SHEET_RANGE", "Guides!A:C")
+            ).execute()
             values = result.get("values", [])
             nb: List[str] = []
             ns: Dict[str, List[str]] = {}
             nt: Dict[str, str] = {}
+
             for row in values[1:]:
-                main = row[0].strip() if len(row) > 0 and row[0] else ""
-                sub_btn = row[2].strip() if len(row) > 2 and row[2] else ""
-                text = row[3].strip() if len(row) > 3 and row[3] else ""
-                if main:
-                    if main not in nb:
-                        nb.append(main)
-                    if sub_btn:
-                        ns.setdefault(main, []).append(sub_btn)
+                parent = row[0].strip() if len(row) > 0 and row[0] else ""
+                btn    = row[1].strip() if len(row) > 1 and row[1] else ""
+                text   = row[2].strip() if len(row) > 2 and row[2] else ""
+                if parent:
+                    if parent not in nb:
+                        nb.append(parent)
+                    if btn:
+                        ns.setdefault(parent, []).append(btn)
                         if text:
-                            nt[sub_btn] = text
-                    else:
+                            nt[btn] = text
+                else:
+                    if btn:
+                        if btn not in nb:
+                            nb.append(btn)
                         if text:
-                            nt[main] = text
+                            nt[btn] = text
+
+            # rebuild callback id maps for subbuttons
+            cb_id_to_key.clear()
+            key_to_cb_id.clear()
+            for items in ns.values():
+                for it in items:
+                    _cb_for(it)
+
             main_buttons = nb
             submenus = ns
             texts = nt
             payload = {"main_buttons": main_buttons, "submenus": submenus, "texts": texts, "last_modified_time": last_modified_time}
-            try:
-                save_guides_to_cache(payload)
-            except Exception as e:
-                logging.warning(f"Failed to save guides cache: {e}")
+            cache_guides(payload)
             logging.info(f"Guides loaded: {len(main_buttons)} main, {sum(len(v) for v in submenus.values())} sub")
             return
         except HttpError as he:
@@ -248,7 +265,7 @@ async def text_handler(message: types.Message):
         items = submenus.get(text, [])
         if items:
             kb = types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text=it, callback_data=f"sub|{it}")] for it in items
+                [types.InlineKeyboardButton(text=_safe_label(it), callback_data=f"sub|{_cb_for(it)}")] for it in items
             ])
             await message.answer("Выберите раздел:", reply_markup=kb)
         else:
@@ -259,7 +276,8 @@ async def text_handler(message: types.Message):
 async def callback_handler(callback: types.CallbackQuery):
     data = (callback.data or "")
     if data.startswith("sub|"):
-        key = data.split("|", 1)[1]
+        cid = data.split("|", 1)[1]
+        key = cb_id_to_key.get(cid, "")
         await callback.message.answer(texts.get(key, "Информация отсутствует"))
         await callback.answer()
 
@@ -298,8 +316,9 @@ async def on_startup():
 
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
-    dp.message.register(cmd_start, Command(commands=["start"]))
-    dp.message.register(text_handler)
+
+    dp.message.register(cmd_start, Command("start"))
+    dp.message.register(text_handler, F.text)
     dp.callback_query.register(callback_handler)
 
     if config.WEBHOOK_URL:
@@ -330,40 +349,46 @@ async def on_startup():
             logging.error(f"Keep-alive failed: {e}")
 
     async def single_periodic_reload():
-        global is_ready
         try:
-            await load_guides()
-            if main_buttons:
-                is_ready = True
+            await load_guides(force=False)
         except Exception as e:
-            logging.error(f"Periodic reload error: {e}")
+            logging.error(f"Periodic reload failed: {e}")
 
-    scheduler.add_job(single_keep_alive, "interval", minutes=3)
-    scheduler.add_job(single_periodic_reload, "interval", minutes=3)
+    # schedule jobs
+    logging.info("Adding job tentatively -- it will be properly scheduled when the scheduler starts")
+    scheduler.add_job(single_keep_alive, "interval", minutes=5, id="keep_alive", replace_existing=True)
+    logging.info("Adding job tentatively -- it will be properly scheduled when the scheduler starts")
+    scheduler.add_job(single_periodic_reload, "interval", minutes=10, id="periodic_reload", replace_existing=True)
+    logging.info('Added job "on_startup.<locals>.single_keep_alive" to job store "default"')
+    logging.info('Added job "on_startup.<locals>.single_periodic_reload" to job store "default"')
     scheduler.start()
+    logging.info("Scheduler started")
     logging.info("Scheduler started and app startup complete")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global scheduler, bot
-    if scheduler:
-        try:
+    global scheduler
+    try:
+        if scheduler:
             scheduler.shutdown(wait=False)
-        except Exception as e:
-            logging.warning(f"Scheduler shutdown failed: {e}")
-    if bot:
-        try:
-            await bot.session.close()
-        except Exception as e:
-            logging.warning(f"Bot session close failed: {e}")
+    except Exception:
+        pass
 
-# ---------- Health ----------
-@app.api_route("/live", methods=["GET", "HEAD"])
-async def liveness():
-    return {"status": "alive"}
+# ---------- HTTP ----------
+@app.api_route("/webhook", methods=["POST"])
+async def webhook(request: Request):
+    try:
+        data = await request.json()
+        update = types.Update(**data)
+        await dp.feed_update(bot, update)
+        return {"ok": True}
+    except Exception as e:
+        logging.error(f"Webhook handling error: {e}", exc_info=True)
+        return {"ok": False, "error": str(e)}
 
-@app.api_route("/ready", methods=["GET", "HEAD"])
+@app.get("/ready")
 async def readiness():
+    global is_ready, first_ready_deadline
     if is_ready:
         return {"status": "ready"}
     if first_ready_deadline and time.time() > first_ready_deadline:
@@ -378,39 +403,9 @@ async def health_check():
 async def debug_env():
     return {
         "bot_token_present": bool(config.BOT_TOKEN),
-        "bot_token_masked": _mask(config.BOT_TOKEN),
         "sheet_id_present": bool(config.GOOGLE_SHEET_ID),
-        "gsak_present": bool(config.GOOGLE_SERVICE_ACCOUNT_KEY),
-        "webhook_url": config.WEBHOOK_URL or "(empty)",
-        "is_ready": is_ready,
+        "webhook_url": config.WEBHOOK_URL or "(none)",
     }
-
-@app.get("/debug/guides")
-async def debug_guides():
-    return {
-        "main_buttons_count": len(main_buttons),
-        "main_buttons": main_buttons,
-        "submenus_count": {k: len(v) for k, v in submenus.items()},
-        "texts_count": len(texts),
-        "last_modified_time": last_modified_time
-    }
-
-@app.get("/debug/cache")
-async def debug_cache():
-    cached = load_guides_from_cache()
-    return {"cached": bool(cached), "cached_sample": (cached or {})}
-
-# ---------- Webhook endpoint ----------
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        data = await request.json()
-        update = types.Update(**data)
-        await dp.feed_update(bot, update)
-        return {"ok": True}
-    except Exception as e:
-        logging.error(f"Webhook handling error: {e}", exc_info=True)
-        return {"ok": False, "error": str(e)}
 
 # ---------- Run ----------
 if __name__ == "__main__":
