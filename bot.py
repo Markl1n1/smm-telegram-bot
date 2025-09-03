@@ -1,5 +1,6 @@
 # bot.py
 import os
+import re
 import time
 import json
 import logging
@@ -75,14 +76,12 @@ def grant_auth(user_id: int):
     auth_sessions[user_id] = time.time() + AUTH_TTL
 
 # ---------- Хелперы сообщений / зачистка истории ----------
-# Храним последние id сообщений по чату, чтобы уме́ть чистить историю.
-chat_msgs: Dict[int, List[int]] = {}
+chat_msgs: Dict[int, List[int]] = {}  # chat_id -> [message_ids]
 
 def _remember_msg(chat_id: int, message_id: int):
     arr = chat_msgs.setdefault(chat_id, [])
     if message_id not in arr:
         arr.append(message_id)
-        # ограничим хвост, чтобы не рос бесконечно
         if len(arr) > 200:
             del arr[:-200]
 
@@ -90,7 +89,6 @@ async def purge_chat(chat_id: int):
     ids = chat_msgs.get(chat_id, [])
     if not ids:
         return
-    # Удаляем с конца (от новых к старым). Игнорируем ошибки.
     for mid in reversed(ids):
         try:
             await bot.delete_message(chat_id, mid)
@@ -116,6 +114,12 @@ def _cb_for(key: str) -> str:
     key_to_cb_id[key] = cid
     cb_id_to_key[cid] = key
     return cid
+
+def main_menu_kb() -> types.ReplyKeyboardMarkup:
+    return types.ReplyKeyboardMarkup(
+        keyboard=[[types.KeyboardButton(text=b)] for b in main_buttons] or [[types.KeyboardButton(text="(меню пусто)")]],
+        resize_keyboard=True
+    )
 
 # ---------- SQLite ----------
 def get_sqlite_conn():
@@ -225,9 +229,8 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
             ns: Dict[str, List[str]] = {}
             nt: Dict[str, str] = {}
 
-            # Разбор по вашей логике:
-            # 1) A пусто, B=Button, C=Text  -> это пункт меню с текстом
-            # 2) A=Parent, B=Sub, C=Text    -> это сабменю родителя A
+            # 1) A пусто, B=Button, C=Text  -> пункт меню с текстом
+            # 2) A=Parent, B=Sub, C=Text    -> сабменю родителя A
             for row in values[1:]:
                 parent = row[0].strip() if len(row) > 0 and row[0] else ""
                 btn    = row[1].strip() if len(row) > 1 and row[1] else ""
@@ -235,14 +238,14 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
                 if not btn and not parent:
                     continue
 
-                if parent:  # тип 2: под-кнопка
+                if parent:
                     if parent not in nb:
                         nb.append(parent)
                     if btn:
                         ns.setdefault(parent, []).append(btn)
                         if text:
                             nt[btn] = text
-                else:       # тип 1: пункт меню с текстом
+                else:
                     if btn and btn not in nb:
                         nb.append(btn)
                     if btn and text:
@@ -280,17 +283,47 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
     else:
         logging.error("Failed to load guides from Google and no cache")
 
-# ---------- UI helpers ----------
-async def show_main_menu(chat_id: int, text: str = "Привет! Выберите опцию:"):
-    if not main_buttons:
-        m = await bot.send_message(chat_id, "Меню пока пустое. Попробуйте позже.")
+# ---------- Media utils ----------
+IMG_EXTS = (".jpg", ".jpeg", ".png")
+
+def extract_image_urls(text: str) -> List[str]:
+    if not text:
+        return []
+    # ищем http/https ссылки, оканчивающиеся на нужные расширения
+    urls = []
+    for token in re.split(r"[\s,;\n]+", text.strip()):
+        if token.lower().endswith(IMG_EXTS) and token.startswith(("http://", "https://")):
+            urls.append(token)
+    # удалим дубли, сохранив порядок
+    seen = set()
+    uniq = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq[:10]  # альбом до 10 фото
+
+async def send_content_with_menu(chat_id: int, content_text: str):
+    """
+    Отправляет либо просто текст (с клавиатурой меню),
+    либо альбом изображений + короткое сервис-сообщение с клавиатурой.
+    """
+    urls = extract_image_urls(content_text)
+    if urls:
+        media = [types.InputMediaPhoto(media=u) for u in urls]
+        msgs = await bot.send_media_group(chat_id, media=media)
+        for m in msgs:
+            _remember_msg(chat_id, m.message_id)
+        # отдельное минимальное сообщение, чтобы «приклеить» reply-keyboard
+        m2 = await bot.send_message(chat_id, " ", reply_markup=main_menu_kb())
+        _remember_msg(chat_id, m2.message_id)
+    else:
+        m = await bot.send_message(chat_id, content_text or "Информация отсутствует", reply_markup=main_menu_kb())
         _remember_msg(chat_id, m.message_id)
-        return
-    kb = types.ReplyKeyboardMarkup(
-        keyboard=[[types.KeyboardButton(text=b)] for b in main_buttons],
-        resize_keyboard=True
-    )
-    m = await bot.send_message(chat_id, text, reply_markup=kb)
+
+# ---------- UI helpers ----------
+async def show_main_menu(chat_id: int, text: str = "Выберите опцию:"):
+    m = await bot.send_message(chat_id, text, reply_markup=main_menu_kb())
     _remember_msg(chat_id, m.message_id)
 
 # ---------- Handlers ----------
@@ -299,26 +332,27 @@ async def cmd_start(message: types.Message):
     chat_id = message.chat.id
     _remember_msg(chat_id, message.message_id)
 
-    # Аутентификация: если нет доступа — просим код
     if not is_authed(user_id):
         awaiting_code.add(user_id)
-        m = await message.answer("Введите кодовое слово:")
-        _remember_msg(chat_id, m.message_id)
+        m1 = await message.answer("Доступ к боту защищён. Для входа требуется кодовое слово.")
+        _remember_msg(chat_id, m1.message_id)
+        m2 = await message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m2.message_id)
         return
 
-    await show_main_menu(chat_id)
+    await show_main_menu(chat_id, text="Привет! Выберите опцию:")
 
 async def cmd_reload(message: types.Message):
-    """Ручное обновление: любой пользователь может вызвать."""
     user_id = message.from_user.id
     chat_id = message.chat.id
     _remember_msg(chat_id, message.message_id)
 
-    # Если не авторизован — не даём пользоваться
     if not is_authed(user_id):
         awaiting_code.add(user_id)
-        m = await message.answer("Введите кодовое слово:")
-        _remember_msg(chat_id, m.message_id)
+        m1 = await message.answer("Доступ к боту защищён. Для входа требуется кодовое слово.")
+        _remember_msg(chat_id, m1.message_id)
+        m2 = await message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m2.message_id)
         return
 
     await purge_chat(chat_id)
@@ -331,33 +365,30 @@ async def text_handler(message: types.Message):
     incoming = (message.text or "").strip()
     _remember_msg(chat_id, message.message_id)
 
-    # Если ждём код — проверяем
+    # кодовая фаза
     if (user_id in awaiting_code) or (not is_authed(user_id)):
         if incoming.lower() == config.CODEWORD.lower():
             awaiting_code.discard(user_id)
             grant_auth(user_id)
-            await purge_chat(chat_id)  # чистый экран после успешной аутентификации
-            await show_main_menu(chat_id, text="Доступ разрешён. Выберите опцию:")
+            await purge_chat(chat_id)
+            await show_main_menu(chat_id, text="Доступ разрешён на 24 часа. Выберите опцию:")
         else:
             m = await message.answer("Неверный код, попробуйте снова")
             _remember_msg(chat_id, m.message_id)
         return
 
-    # Пользователь авторизован — обычная логика меню
+    # меню/сабменю
     if incoming in main_buttons:
         items = submenus.get(incoming, [])
         if items:
-            # Показываем сабменю (очистку истории не делаем — чистим только при выводе текста)
             kb = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text=_safe_label(it), callback_data=f"sub|{_cb_for(it)}")] for it in items
             ])
             m = await message.answer("Выберите раздел:", reply_markup=kb)
             _remember_msg(chat_id, m.message_id)
         else:
-            # Это пункт меню с текстом — чистим всё и показываем только текст
             await purge_chat(chat_id)
-            m = await bot.send_message(chat_id, texts.get(incoming, "Информация отсутствует"))
-            _remember_msg(chat_id, m.message_id)
+            await send_content_with_menu(chat_id, texts.get(incoming, "Информация отсутствует"))
     else:
         m = await message.answer("Не понял. Используйте меню.")
         _remember_msg(chat_id, m.message_id)
@@ -366,11 +397,12 @@ async def callback_handler(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
 
-    # Нет аутентификации — просим код
     if not is_authed(user_id):
         awaiting_code.add(user_id)
-        m = await callback.message.answer("Введите кодовое слово:")
-        _remember_msg(chat_id, m.message_id)
+        m1 = await callback.message.answer("Доступ к боту защищён. Для входа требуется кодовое слово.")
+        _remember_msg(chat_id, m1.message_id)
+        m2 = await callback.message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m2.message_id)
         await callback.answer()
         return
 
@@ -378,10 +410,8 @@ async def callback_handler(callback: types.CallbackQuery):
     if data.startswith("sub|"):
         cid = data.split("|", 1)[1]
         key = cb_id_to_key.get(cid, "")
-        # Показываем текст по сабкнопке — предварительно чистим историю
         await purge_chat(chat_id)
-        m = await bot.send_message(chat_id, texts.get(key, "Информация отсутствует"))
-        _remember_msg(chat_id, m.message_id)
+        await send_content_with_menu(chat_id, texts.get(key, "Информация отсутствует"))
         await callback.answer()
 
 # ---------- Webhook ----------
