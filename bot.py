@@ -9,12 +9,12 @@ from random import uniform
 from typing import Optional, Dict, List
 
 from fastapi import FastAPI, Request, HTTPException
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.client.default import DefaultBotProperties
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -41,7 +41,6 @@ config = Config()
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-# suppress noisy apscheduler warnings about "missed job"
 logging.getLogger("apscheduler.executors.default").setLevel(logging.ERROR)
 
 # ---------- Globals ----------
@@ -55,13 +54,11 @@ CREDS = None
 SHEETS_SERVICE = None
 DRIVE_SERVICE = None
 
-# guides data structures
 main_buttons: List[str] = []
 submenus: Dict[str, List[str]] = {}
 texts: Dict[str, str] = {}
 last_modified_time: Optional[str] = None
 
-# readiness/liveness
 is_started = False
 is_ready = False
 first_ready_deadline: Optional[float] = None
@@ -79,7 +76,7 @@ def get_sqlite_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
-# ---------- SQLite init & cache ----------
+# ---------- SQLite ----------
 def init_sqlite():
     conn = get_sqlite_conn()
     cur = conn.cursor()
@@ -135,15 +132,15 @@ def validate_env_vars():
     if not config.BOT_TOKEN:
         raise EnvironmentError("BOT_TOKEN is required")
     if not config.GOOGLE_SERVICE_ACCOUNT_KEY:
-        logging.warning("GOOGLE_SERVICE_ACCOUNT_KEY not set — guides will be unavailable until provided")
+        logging.warning("GOOGLE_SERVICE_ACCOUNT_KEY not set — guides unavailable")
     if not config.GOOGLE_SHEET_ID:
-        logging.warning("GOOGLE_SHEET_ID not set — guides will be unavailable until provided")
+        logging.warning("GOOGLE_SHEET_ID not set — guides unavailable")
 
-# ---------- Google init ----------
+# ---------- Google ----------
 def init_google_services():
     global CREDS, SHEETS_SERVICE, DRIVE_SERVICE
     if not config.GOOGLE_SERVICE_ACCOUNT_KEY:
-        logging.warning("Skipping Google init: no service account key")
+        logging.warning("Skipping Google init: no key")
         return
     try:
         info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_KEY)
@@ -160,13 +157,8 @@ def init_google_services():
     except Exception as e:
         logging.error(f"Failed to init Google services: {e}")
 
-# ---------- Load guides (retries + cache fallback) ----------
+# ---------- Load guides ----------
 async def load_guides(force: bool = False, retries: int = 6, base_backoff: float = 1.5):
-    """
-    Tries to load guides from Google Drive/Sheets with retries.
-    On success — updates in-memory structures and writes cache.
-    On repeated failure — attempts to load cache from SQLite.
-    """
     global main_buttons, submenus, texts, last_modified_time
 
     if not SHEETS_SERVICE or not DRIVE_SERVICE or not config.GOOGLE_SHEET_ID:
@@ -191,18 +183,13 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
                 return
 
             last_modified_time = modified_time
-            sheet = SHEETS_SERVICE.spreadsheets()
-            result = sheet.values().get(spreadsheetId=config.GOOGLE_SHEET_ID, range="Main!A:D").execute()
+            result = SHEETS_SERVICE.spreadsheets().values().get(spreadsheetId=config.GOOGLE_SHEET_ID, range="Main!A:D").execute()
             values = result.get("values", [])
-            # Parse values
             nb: List[str] = []
             ns: Dict[str, List[str]] = {}
             nt: Dict[str, str] = {}
-            # assume first row is header
             for row in values[1:]:
-                # columns: A main, B submenu_key (ignored), C sub_button, D text
                 main = row[0].strip() if len(row) > 0 and row[0] else ""
-                sub_key = row[1].strip() if len(row) > 1 and row[1] else ""
                 sub_btn = row[2].strip() if len(row) > 2 and row[2] else ""
                 text = row[3].strip() if len(row) > 3 and row[3] else ""
                 if main:
@@ -218,44 +205,41 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
             main_buttons = nb
             submenus = ns
             texts = nt
-            payload = {
-                "main_buttons": main_buttons,
-                "submenus": submenus,
-                "texts": texts,
-                "last_modified_time": last_modified_time
-            }
+            payload = {"main_buttons": main_buttons, "submenus": submenus, "texts": texts, "last_modified_time": last_modified_time}
             try:
                 save_guides_to_cache(payload)
             except Exception as e:
                 logging.warning(f"Failed to save guides cache: {e}")
-            logging.info(f"Guides loaded: {len(main_buttons)} main buttons, {sum(len(v) for v in submenus.values()) if submenus else 0} sub buttons")
+            logging.info(f"Guides loaded: {len(main_buttons)} main, {sum(len(v) for v in submenus.values())} sub")
             return
         except HttpError as he:
-            logging.error(f"HttpError on load_guides (attempt {attempt}/{retries}): {he}")
+            logging.error(f"HttpError load_guides {attempt}/{retries}: {he}")
         except Exception as e:
-            logging.warning(f"Transient error on load_guides (attempt {attempt}/{retries}): {e}")
+            logging.warning(f"Transient error load_guides {attempt}/{retries}: {e}")
 
         if attempt < retries:
-            delay = base_backoff * attempt + uniform(0, 1)
-            await asyncio.sleep(delay)
+            await asyncio.sleep(base_backoff * attempt + uniform(0, 1))
 
-    # fallback: load from cache
     cached = load_guides_from_cache()
     if cached:
         main_buttons = cached.get("main_buttons", [])
         submenus = cached.get("submenus", {})
         texts = cached.get("texts", {})
         last_modified_time = cached.get("last_modified_time")
-        logging.warning("Loaded guides from cache after failing to fetch Google")
+        logging.warning("Loaded guides from cache after failures")
     else:
-        logging.error("Failed to load guides from Google and no cache available")
+        logging.error("Failed to load guides from Google and no cache")
 
 # ---------- Handlers ----------
 async def cmd_start(message: types.Message):
-    # minimal start
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    for b in main_buttons:
-        kb.add(types.KeyboardButton(text=b))
+    if not main_buttons:
+        await message.answer("Меню пока пустое. Попробуйте позже.")
+        return
+
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[[types.KeyboardButton(text=b)] for b in main_buttons],
+        resize_keyboard=True
+    )
     await message.answer("Привет! Выберите опцию:", reply_markup=kb)
 
 async def text_handler(message: types.Message):
@@ -266,9 +250,9 @@ async def text_handler(message: types.Message):
     if text in main_buttons:
         items = submenus.get(text, [])
         if items:
-            kb = types.InlineKeyboardMarkup(row_width=1)
-            for it in items:
-                kb.add(types.InlineKeyboardButton(text=it, callback_data=f"sub|{it}"))
+            kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text=it, callback_data=f"sub|{it}")] for it in items
+            ])
             await message.answer("Выберите раздел:", reply_markup=kb)
         else:
             await message.answer(texts.get(text, "Информация отсутствует"))
@@ -282,19 +266,17 @@ async def callback_handler(callback: types.CallbackQuery):
         await callback.message.answer(texts.get(key, "Информация отсутствует"))
         await callback.answer()
 
-# ---------- Webhook helper ----------
+# ---------- Webhook ----------
 async def ensure_webhook(bot_obj: Bot, url: Optional[str], retries: int = 4):
     if not url:
         logging.info("WEBHOOK_URL empty, skipping set_webhook")
         return
-    attempt = 0
-    while attempt < retries:
-        attempt += 1
+    for attempt in range(1, retries + 1):
         try:
             info = await bot_obj.get_webhook_info()
             current = getattr(info, "url", "") or ""
             if current == url:
-                logging.info("Webhook already set; skipping set_webhook")
+                logging.info("Webhook already set; skipping")
                 return
             await bot_obj.set_webhook(url)
             logging.info("Webhook set successfully")
@@ -304,26 +286,10 @@ async def ensure_webhook(bot_obj: Bot, url: Optional[str], retries: int = 4):
             await asyncio.sleep(1 + attempt)
     logging.error("Failed to set webhook after retries")
 
-# ---------- Polling Fallback ----------
-async def run_polling(bot: Bot, dp: Dispatcher):
-    """Run polling loop as fallback if webhook not available"""
-    logging.info("Starting polling loop")
-    try:
-        # на всякий случай снимаем вебхук, чтобы Telegram начал слать обновления для polling
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-        except Exception as e:
-            logging.debug(f"delete_webhook ignored error: {e}")
-        await dp.start_polling(bot)
-    except Exception as e:
-        logging.error(f"Polling crashed: {e}", exc_info=True)
-
-# ---------- Startup / Scheduler ----------
+# ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def on_startup():
     global bot, dp, scheduler, is_started, is_ready, first_ready_deadline
-    # объявляем тоже здесь, чтобы не было ошибок "used prior to global declaration"
-    global main_buttons, submenus, texts, last_modified_time
 
     is_started = True
     first_ready_deadline = time.time() + 120
@@ -332,48 +298,31 @@ async def on_startup():
     validate_env_vars()
     init_google_services()
 
-    # bot + dispatcher
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
+    bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
-
-    # register handlers
     dp.message.register(cmd_start, Command(commands=["start"]))
     dp.message.register(text_handler)
     dp.callback_query.register(callback_handler)
 
-    # webhook or polling fallback
     if config.WEBHOOK_URL:
-        try:
-            await ensure_webhook(bot, config.WEBHOOK_URL)
-            logging.info("Running in WEBHOOK mode")
-        except Exception as e:
-            logging.error(f"Webhook setup failed: {e}, falling back to POLLING")
-            asyncio.create_task(run_polling(bot, dp))
-    else:
-        logging.warning("No WEBHOOK_URL; falling back to POLLING")
-        asyncio.create_task(run_polling(bot, dp))
+        await ensure_webhook(bot, config.WEBHOOK_URL)
+        logging.info("Running in WEBHOOK mode")
 
-    # Try to load guides (won't raise if fails)
     try:
         await load_guides(force=True)
         if main_buttons:
             is_ready = True
     except Exception as e:
-        logging.error(f"load_guides on startup failed (ignored): {e}")
-        # try cache explicitly
+        logging.error(f"load_guides startup failed: {e}")
         cached = load_guides_from_cache()
         if cached:
-            logging.info("Loaded guides from cache during startup fallback")
+            global main_buttons, submenus, texts, last_modified_time
             main_buttons = cached.get("main_buttons", [])
             submenus = cached.get("submenus", {})
             texts = cached.get("texts", {})
             last_modified_time = cached.get("last_modified_time")
             is_ready = True
 
-    # scheduler
     scheduler = AsyncIOScheduler()
 
     async def single_keep_alive():
@@ -402,7 +351,6 @@ async def on_shutdown():
     global scheduler, bot
     if scheduler:
         try:
-            # Важно: без await (иначе TypeError при None/разной реализации)
             scheduler.shutdown(wait=False)
         except Exception as e:
             logging.warning(f"Scheduler shutdown failed: {e}")
@@ -412,7 +360,7 @@ async def on_shutdown():
         except Exception as e:
             logging.warning(f"Bot session close failed: {e}")
 
-# ---------- Health / Debug endpoints ----------
+# ---------- Health ----------
 @app.api_route("/live", methods=["GET", "HEAD"])
 async def liveness():
     return {"status": "alive"}
@@ -461,7 +409,6 @@ async def webhook(request: Request):
     try:
         data = await request.json()
         update = types.Update(**data)
-        # feed update into dispatcher
         await dp.feed_update(bot, update)
         return {"ok": True}
     except Exception as e:
