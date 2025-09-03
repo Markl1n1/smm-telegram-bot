@@ -6,7 +6,7 @@ import logging
 import sqlite3
 import asyncio
 from random import uniform
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 
 from fastapi import FastAPI, Request, HTTPException
 from aiogram import Bot, Dispatcher, types, F
@@ -27,6 +27,8 @@ class Config:
     GOOGLE_SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY")
     KOYEB_PUBLIC_DOMAIN = os.getenv("KOYEB_PUBLIC_DOMAIN")
     PORT = int(os.getenv("PORT", 8000))
+    RELOAD_MINUTES = int(os.getenv("RELOAD_MINUTES", "10"))
+    CODEWORD = os.getenv("CODEWORD", "infobot")  # кодовое слово
 
     @property
     def WEBHOOK_URL(self) -> Optional[str]:
@@ -60,17 +62,41 @@ is_started = False
 is_ready = False
 first_ready_deadline: Optional[float] = None
 
-def _mask(s: Optional[str]) -> str:
-    if not s:
-        return "(empty)"
-    if len(s) <= 6:
-        return "*" * len(s)
-    return s[:3] + "*" * (len(s) - 6) + s[-3:]
+# ---- Auth (в памяти) ----
+AUTH_TTL = 24 * 60 * 60  # 24 часа
+auth_sessions: Dict[int, float] = {}  # user_id -> expires_at
+awaiting_code: Set[int] = set()       # ждём код после /start
 
-def get_sqlite_conn():
-    conn = sqlite3.connect("bot.db", timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+def is_authed(user_id: int) -> bool:
+    exp = auth_sessions.get(user_id, 0)
+    return exp > time.time()
+
+def grant_auth(user_id: int):
+    auth_sessions[user_id] = time.time() + AUTH_TTL
+
+# ---------- Хелперы сообщений / зачистка истории ----------
+# Храним последние id сообщений по чату, чтобы уме́ть чистить историю.
+chat_msgs: Dict[int, List[int]] = {}
+
+def _remember_msg(chat_id: int, message_id: int):
+    arr = chat_msgs.setdefault(chat_id, [])
+    if message_id not in arr:
+        arr.append(message_id)
+        # ограничим хвост, чтобы не рос бесконечно
+        if len(arr) > 200:
+            del arr[:-200]
+
+async def purge_chat(chat_id: int):
+    ids = chat_msgs.get(chat_id, [])
+    if not ids:
+        return
+    # Удаляем с конца (от новых к старым). Игнорируем ошибки.
+    for mid in reversed(ids):
+        try:
+            await bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
+    chat_msgs[chat_id] = []
 
 # ---------- Callback data helpers ----------
 cb_id_to_key: Dict[str, str] = {}
@@ -92,6 +118,11 @@ def _cb_for(key: str) -> str:
     return cid
 
 # ---------- SQLite ----------
+def get_sqlite_conn():
+    conn = sqlite3.connect("bot.db", timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 def init_sqlite():
     conn = get_sqlite_conn()
     cur = conn.cursor()
@@ -194,23 +225,28 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
             ns: Dict[str, List[str]] = {}
             nt: Dict[str, str] = {}
 
+            # Разбор по вашей логике:
+            # 1) A пусто, B=Button, C=Text  -> это пункт меню с текстом
+            # 2) A=Parent, B=Sub, C=Text    -> это сабменю родителя A
             for row in values[1:]:
                 parent = row[0].strip() if len(row) > 0 and row[0] else ""
                 btn    = row[1].strip() if len(row) > 1 and row[1] else ""
                 text   = row[2].strip() if len(row) > 2 and row[2] else ""
-                if parent:
+                if not btn and not parent:
+                    continue
+
+                if parent:  # тип 2: под-кнопка
                     if parent not in nb:
                         nb.append(parent)
                     if btn:
                         ns.setdefault(parent, []).append(btn)
                         if text:
                             nt[btn] = text
-                else:
-                    if btn:
-                        if btn not in nb:
-                            nb.append(btn)
-                        if text:
-                            nt[btn] = text
+                else:       # тип 1: пункт меню с текстом
+                    if btn and btn not in nb:
+                        nb.append(btn)
+                    if btn and text:
+                        nt[btn] = text
 
             # rebuild callback id maps for subbuttons
             cb_id_to_key.clear()
@@ -244,41 +280,108 @@ async def load_guides(force: bool = False, retries: int = 6, base_backoff: float
     else:
         logging.error("Failed to load guides from Google and no cache")
 
-# ---------- Handlers ----------
-async def cmd_start(message: types.Message):
+# ---------- UI helpers ----------
+async def show_main_menu(chat_id: int, text: str = "Привет! Выберите опцию:"):
     if not main_buttons:
-        await message.answer("Меню пока пустое. Попробуйте позже.")
+        m = await bot.send_message(chat_id, "Меню пока пустое. Попробуйте позже.")
+        _remember_msg(chat_id, m.message_id)
         return
-
     kb = types.ReplyKeyboardMarkup(
         keyboard=[[types.KeyboardButton(text=b)] for b in main_buttons],
         resize_keyboard=True
     )
-    await message.answer("Привет! Выберите опцию:", reply_markup=kb)
+    m = await bot.send_message(chat_id, text, reply_markup=kb)
+    _remember_msg(chat_id, m.message_id)
+
+# ---------- Handlers ----------
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    _remember_msg(chat_id, message.message_id)
+
+    # Аутентификация: если нет доступа — просим код
+    if not is_authed(user_id):
+        awaiting_code.add(user_id)
+        m = await message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m.message_id)
+        return
+
+    await show_main_menu(chat_id)
+
+async def cmd_reload(message: types.Message):
+    """Ручное обновление: любой пользователь может вызвать."""
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    _remember_msg(chat_id, message.message_id)
+
+    # Если не авторизован — не даём пользоваться
+    if not is_authed(user_id):
+        awaiting_code.add(user_id)
+        m = await message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m.message_id)
+        return
+
+    await purge_chat(chat_id)
+    await load_guides(force=True)
+    await show_main_menu(chat_id, text="Данные обновлены. Выберите опцию:")
 
 async def text_handler(message: types.Message):
-    text = (message.text or "").strip()
-    if not text:
-        await message.answer("Пустое сообщение.")
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    incoming = (message.text or "").strip()
+    _remember_msg(chat_id, message.message_id)
+
+    # Если ждём код — проверяем
+    if (user_id in awaiting_code) or (not is_authed(user_id)):
+        if incoming.lower() == config.CODEWORD.lower():
+            awaiting_code.discard(user_id)
+            grant_auth(user_id)
+            await purge_chat(chat_id)  # чистый экран после успешной аутентификации
+            await show_main_menu(chat_id, text="Доступ разрешён. Выберите опцию:")
+        else:
+            m = await message.answer("Неверный код, попробуйте снова")
+            _remember_msg(chat_id, m.message_id)
         return
-    if text in main_buttons:
-        items = submenus.get(text, [])
+
+    # Пользователь авторизован — обычная логика меню
+    if incoming in main_buttons:
+        items = submenus.get(incoming, [])
         if items:
+            # Показываем сабменю (очистку истории не делаем — чистим только при выводе текста)
             kb = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text=_safe_label(it), callback_data=f"sub|{_cb_for(it)}")] for it in items
             ])
-            await message.answer("Выберите раздел:", reply_markup=kb)
+            m = await message.answer("Выберите раздел:", reply_markup=kb)
+            _remember_msg(chat_id, m.message_id)
         else:
-            await message.answer(texts.get(text, "Информация отсутствует"))
+            # Это пункт меню с текстом — чистим всё и показываем только текст
+            await purge_chat(chat_id)
+            m = await bot.send_message(chat_id, texts.get(incoming, "Информация отсутствует"))
+            _remember_msg(chat_id, m.message_id)
     else:
-        await message.answer("Не понял. Используйте меню.")
+        m = await message.answer("Не понял. Используйте меню.")
+        _remember_msg(chat_id, m.message_id)
 
 async def callback_handler(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+
+    # Нет аутентификации — просим код
+    if not is_authed(user_id):
+        awaiting_code.add(user_id)
+        m = await callback.message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m.message_id)
+        await callback.answer()
+        return
+
     data = (callback.data or "")
     if data.startswith("sub|"):
         cid = data.split("|", 1)[1]
         key = cb_id_to_key.get(cid, "")
-        await callback.message.answer(texts.get(key, "Информация отсутствует"))
+        # Показываем текст по сабкнопке — предварительно чистим историю
+        await purge_chat(chat_id)
+        m = await bot.send_message(chat_id, texts.get(key, "Информация отсутствует"))
+        _remember_msg(chat_id, m.message_id)
         await callback.answer()
 
 # ---------- Webhook ----------
@@ -305,7 +408,7 @@ async def ensure_webhook(bot_obj: Bot, url: Optional[str], retries: int = 4):
 @app.on_event("startup")
 async def on_startup():
     global bot, dp, scheduler, is_started, is_ready, first_ready_deadline
-    global main_buttons, submenus, texts, last_modified_time  # ← добавляем здесь
+    global main_buttons, submenus, texts, last_modified_time
 
     is_started = True
     first_ready_deadline = time.time() + 120
@@ -314,10 +417,15 @@ async def on_startup():
     validate_env_vars()
     init_google_services()
 
-    bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    bot_init = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    global bot
+    bot = bot_init
+    dp_local = Dispatcher(storage=MemoryStorage())
+    global dp
+    dp = dp_local
 
     dp.message.register(cmd_start, Command("start"))
+    dp.message.register(cmd_reload, Command("reload"))
     dp.message.register(text_handler, F.text)
     dp.callback_query.register(callback_handler)
 
@@ -339,7 +447,9 @@ async def on_startup():
             last_modified_time = cached.get("last_modified_time")
             is_ready = True
 
-    scheduler = AsyncIOScheduler()
+    scheduler_local = AsyncIOScheduler()
+    global scheduler
+    scheduler = scheduler_local
 
     async def single_keep_alive():
         try:
@@ -354,11 +464,10 @@ async def on_startup():
         except Exception as e:
             logging.error(f"Periodic reload failed: {e}")
 
-    # schedule jobs
     logging.info("Adding job tentatively -- it will be properly scheduled when the scheduler starts")
     scheduler.add_job(single_keep_alive, "interval", minutes=5, id="keep_alive", replace_existing=True)
     logging.info("Adding job tentatively -- it will be properly scheduled when the scheduler starts")
-    scheduler.add_job(single_periodic_reload, "interval", minutes=10, id="periodic_reload", replace_existing=True)
+    scheduler.add_job(single_periodic_reload, "interval", minutes=config.RELOAD_MINUTES, id="periodic_reload", replace_existing=True)
     logging.info('Added job "on_startup.<locals>.single_keep_alive" to job store "default"')
     logging.info('Added job "on_startup.<locals>.single_periodic_reload" to job store "default"')
     scheduler.start()
@@ -405,6 +514,7 @@ async def debug_env():
         "bot_token_present": bool(config.BOT_TOKEN),
         "sheet_id_present": bool(config.GOOGLE_SHEET_ID),
         "webhook_url": config.WEBHOOK_URL or "(none)",
+        "reload_minutes": config.RELOAD_MINUTES,
     }
 
 # ---------- Run ----------
