@@ -289,33 +289,36 @@ IMG_EXTS = (".jpg", ".jpeg", ".png")
 def extract_image_urls(text: str) -> List[str]:
     if not text:
         return []
-    # ищем http/https ссылки, оканчивающиеся на нужные расширения
     urls = []
     for token in re.split(r"[\s,;\n]+", text.strip()):
         if token.lower().endswith(IMG_EXTS) and token.startswith(("http://", "https://")):
             urls.append(token)
-    # удалим дубли, сохранив порядок
+    # remove duplicates, keep order
     seen = set()
     uniq = []
     for u in urls:
         if u not in seen:
             seen.add(u)
             uniq.append(u)
-    return uniq[:10]  # альбом до 10 фото
+    return uniq[:10]  # Telegram альбом до 10 фото
 
 async def send_content_with_menu(chat_id: int, content_text: str):
     """
     Отправляет либо просто текст (с клавиатурой меню),
-    либо альбом изображений + короткое сервис-сообщение с клавиатурой.
+    либо 1 фото, либо альбом изображений, после чего всегда — сообщение с меню.
     """
     urls = extract_image_urls(content_text)
     if urls:
-        media = [types.InputMediaPhoto(media=u) for u in urls]
-        msgs = await bot.send_media_group(chat_id, media=media)
-        for m in msgs:
+        if len(urls) == 1:
+            m = await bot.send_photo(chat_id, urls[0])
             _remember_msg(chat_id, m.message_id)
-        # отдельное минимальное сообщение, чтобы «приклеить» reply-keyboard
-        m2 = await bot.send_message(chat_id, " ", reply_markup=main_menu_kb())
+        else:
+            media = [types.InputMediaPhoto(media=u) for u in urls]
+            msgs = await bot.send_media_group(chat_id, media=media)
+            for m in msgs:
+                _remember_msg(chat_id, m.message_id)
+        # Всегда отдельное сообщение, чтобы прикрепить reply-клавиатуру
+        m2 = await bot.send_message(chat_id, "Выберите опцию:", reply_markup=main_menu_kb())
         _remember_msg(chat_id, m2.message_id)
     else:
         m = await bot.send_message(chat_id, content_text or "Информация отсутствует", reply_markup=main_menu_kb())
@@ -358,6 +361,22 @@ async def cmd_reload(message: types.Message):
     await purge_chat(chat_id)
     await load_guides(force=True)
     await show_main_menu(chat_id, text="Данные обновлены. Выберите опцию:")
+
+async def cmd_wake(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    _remember_msg(chat_id, message.message_id)
+
+    if not is_authed(user_id):
+        awaiting_code.add(user_id)
+        m1 = await message.answer("Доступ к боту защищён. Для входа требуется кодовое слово.")
+        _remember_msg(chat_id, m1.message_id)
+        m2 = await message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m2.message_id)
+        return
+
+    m = await message.answer("Я на связи ✅", reply_markup=main_menu_kb())
+    _remember_msg(chat_id, m.message_id)
 
 async def text_handler(message: types.Message):
     user_id = message.from_user.id
@@ -456,6 +475,7 @@ async def on_startup():
 
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_reload, Command("reload"))
+    dp.message.register(cmd_wake,   Command("wake"))
     dp.message.register(text_handler, F.text)
     dp.callback_query.register(callback_handler)
 
