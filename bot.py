@@ -287,6 +287,7 @@ async def ensure_webhook(bot_obj: Bot, url: Optional[str], retries: int = 4):
 @app.on_event("startup")
 async def on_startup():
     global bot, dp, scheduler, is_started, is_ready, first_ready_deadline
+    global main_buttons, submenus, texts, last_modified_time  # ← добавляем здесь
 
     is_started = True
     first_ready_deadline = time.time() + 120
@@ -313,7 +314,6 @@ async def on_startup():
         logging.error(f"load_guides startup failed: {e}")
         cached = load_guides_from_cache()
         if cached:
-            global main_buttons, submenus, texts, last_modified_time
             main_buttons = cached.get("main_buttons", [])
             submenus = cached.get("submenus", {})
             texts = cached.get("texts", {})
