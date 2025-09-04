@@ -13,7 +13,7 @@ NUMLOOKUP_API_KEY = os.getenv(
 )
 SMSMOBILE_API_KEY = os.getenv(
     "SMSMOBILE_API_KEY",
-    "e40a6bce72b0127b4f241fb19085d28447b2059729ee1bc3",
+    "2e83b76b788bd1fed079505f513a420b45b0ee9db85d372d",
 )
 
 NUMLOOKUP_ENDPOINT = "https://api.numlookupapi.com/v1/validate/{number}"
@@ -150,29 +150,29 @@ def format_result_markdown(result: Dict[str, Any]) -> str:
     if nl.get("ok"):
         items = []
         if nl_valid is not None:
-            items.append(f"• valid: <b>{'yes' if nl_valid else 'no'}</b>")
+            items.append(f"Valid: <b>{'✅' if nl_valid else '❌'}</b>")
         if nl_international:
-            items.append(f"• international: <code>{nl_international}</code>")
+            items.append(f"International: <code>{nl_international}</code>")
         if nl_country:
-            items.append(f"• country: {nl_country}")
+            items.append(f"Country: {nl_country}")
         if nl_carrier:
-            items.append(f"• carrier: {nl_carrier}")
+            items.append(f"Carrier: {nl_carrier}")
         if nl_line:
-            items.append(f"• line type: {nl_line}")
+            items.append(f"Type: {nl_line}")
         if not items:
-            items.append("• (нет детальной информации)")
+            items.append("Unknown")
         parts.extend(items)
     else:
-        parts.append(f"• ❌ error (status={nl.get('status')}): {nl.get('error') or nl.get('data')}")
+        parts.append(f"❌ error (status={nl.get('status')})")
 
     # SMSMobile WhatsApp
-    parts.append("\n<b>SMSMobileAPI (WhatsApp)</b>")
+    parts.append("\n<b>WhatsApp</b>")
     if sm.get("ok"):
         if sm_found is not None:
-            parts.append(f"• contact_found_on_whatsapp: <b>{'yes' if sm_found else 'no'}</b>")
+            parts.append(f"Whatsapp: <b>{'✅' if sm_found else '❌'}</b>")
         else:
-            parts.append(f"• ответ: <code>{json.dumps(sm_data, ensure_ascii=False)}</code>")
+            parts.append(f"Ответ: <code>{json.dumps(sm_data, ensure_ascii=False)}</code>")
     else:
-        parts.append(f"• ❌ error (status={sm.get('status')}): {sm.get('error') or sm.get('data')}")
+        parts.append(f"❌ error (status={sm.get('status')})")
 
     return "\n".join(parts)
