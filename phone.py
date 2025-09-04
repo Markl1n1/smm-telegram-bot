@@ -18,7 +18,7 @@ NUMLOOKUP_ENDPOINT = "https://api.numlookupapi.com/v1/validate/{number}"
 SMSMOBILE_ENDPOINT = "https://api.smsmobileapi.com/whatsapp/checknumber/"
 
 # Separate connect/read timeouts (connect=5s, read=25s)
-HTTP_TIMEOUT = (5, 25)
+HTTP_TIMEOUT = (1, 10)
 
 
 def normalize_number(user_input: str) -> str:
