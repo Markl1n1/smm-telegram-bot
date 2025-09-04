@@ -21,6 +21,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# ▶▶ NEW: phone validation module
+from phone import check_phone, format_result_markdown
+
 # ---------- Config ----------
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -369,6 +372,40 @@ async def cmd_wake(message: types.Message):
     m = await message.answer("Я на связи ✅", reply_markup=main_menu_kb())
     _remember_msg(chat_id, m.message_id)
 
+# ▶▶ NEW: /check command
+async def cmd_check(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    _remember_msg(chat_id, message.message_id)
+
+    # Auth like other commands
+    if not is_authed(user_id):
+        awaiting_code.add(user_id)
+        m1 = await message.answer("Доступ к боту защищён. Для входа требуется кодовое слово.")
+        _remember_msg(chat_id, m1.message_id)
+        m2 = await message.answer("Введите кодовое слово:")
+        _remember_msg(chat_id, m2.message_id)
+        return
+
+    # Extract phone after /check
+    text = (message.text or "").strip()
+    # Accept formats: "/check +447..." or "/check 447..." or "/check\n447..."
+    m = re.match(r"^/check(?:@\w+)?\s+(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        tip = "Пример: <code>/check +447435771497</code>"
+        m1 = await message.answer(f"Укажите номер телефона. {tip}")
+        _remember_msg(chat_id, m1.message_id)
+        return
+
+    user_number = m.group(1).strip()
+
+    # Run the blocking HTTP calls in a thread to avoid blocking the event loop
+    result = await asyncio.to_thread(check_phone, user_number)
+    reply = await asyncio.to_thread(format_result_markdown, result)
+
+    out = await message.answer(reply, disable_web_page_preview=True)
+    _remember_msg(chat_id, out.message_id)
+
 async def text_handler(message: types.Message):
     user_id = message.from_user.id
     chat_id = message.chat.id
@@ -465,6 +502,8 @@ async def on_startup():
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_reload, Command("reload"))
     dp.message.register(cmd_wake,   Command("wake"))
+    # ▶▶ register /check
+    dp.message.register(cmd_check,  Command("check"))
     dp.message.register(text_handler, F.text)
     dp.callback_query.register(callback_handler)
 

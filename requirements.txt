@@ -6,3 +6,5 @@ google-auth==2.29.0
 google-api-python-client==2.142.0
 cachetools==5.3.3
 apscheduler==3.10.4
+phonenumbers
+requests
