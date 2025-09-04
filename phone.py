@@ -1,12 +1,10 @@
-# phone.py
 import os
 import re
 import json
-from typing import Dict, Any, Optional
-
 import requests
+from typing import Dict, Any
 
-# --- API keys (env vars win; fall back to the keys you provided) ---
+# --- API keys (env vars win; fall back to defaults) ---
 NUMLOOKUP_API_KEY = os.getenv(
     "NUMLOOKUP_API_KEY",
     "num_live_tcLFYRa5HmnTr5CgiClWzwTSu4qYT94aswZw1EWe",
@@ -19,26 +17,19 @@ SMSMOBILE_API_KEY = os.getenv(
 NUMLOOKUP_ENDPOINT = "https://api.numlookupapi.com/v1/validate/{number}"
 SMSMOBILE_ENDPOINT = "https://api.smsmobileapi.com/whatsapp/checknumber/"
 
-HTTP_TIMEOUT = 15  # seconds
+# Separate connect/read timeouts (connect=5s, read=25s)
+HTTP_TIMEOUT = (5, 25)
 
 
 def normalize_number(user_input: str) -> str:
-    """
-    Normalize a phone number:
-    - keep leading '+' if present, otherwise digits only
-    - remove spaces, dashes, parentheses and other separators
-    """
+    """Normalize a phone number."""
     s = user_input.strip()
     if not s:
         return ""
-
     if s.startswith("+"):
-        # Keep leading '+' and strip all non-digits after it
         digits = re.sub(r"\D", "", s[1:])
         return f"+{digits}" if digits else "+"
-    else:
-        # Only digits
-        return re.sub(r"\D", "", s)
+    return re.sub(r"\D", "", s)
 
 
 def digits_only(number: str) -> str:
@@ -53,45 +44,42 @@ def _safe_get_json(resp: requests.Response) -> Any:
         return {"raw_text": resp.text}
 
 
+def _sanitize_url(url: str) -> str:
+    """Remove API key for safe logging."""
+    return re.sub(r"(apikey=)[^&]+", r"\1***", url)
+
+
 def query_numlookup(number: str) -> Dict[str, Any]:
-    """
-    Call NumlookupAPI with + or without + (API accepts both).
-    Returns a dict with status and data/error.
-    """
+    """Call NumlookupAPI with + or without + (API accepts both)."""
     url = NUMLOOKUP_ENDPOINT.format(number=number.lstrip("+"))
     params = {"apikey": NUMLOOKUP_API_KEY}
     try:
         r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
         data = _safe_get_json(r)
-        ok = r.ok
-        return {"ok": ok, "status": r.status_code, "data": data}
+        return {"ok": r.ok, "status": r.status_code, "data": data}
     except requests.RequestException as e:
         return {"ok": False, "status": None, "error": str(e)}
 
 
 def query_smsmobile(number: str) -> Dict[str, Any]:
-    """
-    Call smsmobileapi.com WhatsApp checknumber endpoint.
-    Their docs state two params: apikey (yours) and recipients (phone to verify).
-    We send digits-only to be safe.
-    """
+    """Call smsmobileapi.com WhatsApp checknumber endpoint with retries."""
     params = {
         "apikey": SMSMOBILE_API_KEY,
         "recipients": digits_only(number),
     }
-    try:
-        r = requests.get(SMSMOBILE_ENDPOINT, params=params, timeout=HTTP_TIMEOUT)
-        data = _safe_get_json(r)
-        ok = r.ok
-        return {"ok": ok, "status": r.status_code, "data": data}
-    except requests.RequestException as e:
-        return {"ok": False, "status": None, "error": str(e)}
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(SMSMOBILE_ENDPOINT, params=params, timeout=HTTP_TIMEOUT)
+            data = _safe_get_json(r)
+            return {"ok": r.ok, "status": r.status_code, "data": data}
+        except requests.RequestException as e:
+            last_err = str(e)
+    return {"ok": False, "status": None, "error": last_err}
 
 
 def check_phone(user_input: str) -> Dict[str, Any]:
-    """
-    Orchestrates both checks and returns a single structured result.
-    """
+    """Run both checks and return structured result."""
     normalized = normalize_number(user_input)
     if not normalized or normalized in {"+", ""}:
         return {
@@ -113,10 +101,7 @@ def check_phone(user_input: str) -> Dict[str, Any]:
 
 
 def format_result_markdown(result: Dict[str, Any]) -> str:
-    """
-    Build a user-friendly HTML-formatted message to send via Telegram.
-    (Aiogram is configured with ParseMode.HTML in your bot.)
-    """
+    """Build HTML-formatted result message for Telegram."""
     if not result.get("ok"):
         return f"❌ <b>Ошибка</b>: {result.get('error', 'Unknown error')}"
 
@@ -124,7 +109,7 @@ def format_result_markdown(result: Dict[str, Any]) -> str:
     nl = result.get("numlookupapi", {})
     sm = result.get("smsmobileapi", {})
 
-    # Extract some friendly fields from Numlookup if available
+    # Numlookup fields
     nl_data = nl.get("data") or {}
     nl_valid = nl_data.get("valid")
     nl_international = nl_data.get("international_format")
@@ -132,40 +117,34 @@ def format_result_markdown(result: Dict[str, Any]) -> str:
     nl_carrier = nl_data.get("carrier")
     nl_line = nl_data.get("line_type")
 
-    # Extract smsmobile whatsapp check
+    # smsmobile WhatsApp field
     sm_data = sm.get("data") or {}
     sm_found = None
     if isinstance(sm_data, dict):
-        # documented example field: "contact_found_on_whatsapp": "yes"/"no"
         v = sm_data.get("contact_found_on_whatsapp")
         if isinstance(v, str):
             sm_found = v.lower() in {"yes", "true", "1"}
 
-    # Build message
     parts = []
     parts.append(f"🔎 <b>Проверка номера</b>: <code>{normalized}</code>")
 
     # Numlookup
     parts.append("\n<b>NumlookupAPI</b>")
     if nl.get("ok"):
-        items = []
         if nl_valid is not None:
-            items.append(f"Valid: <b>{'✅' if nl_valid else '❌'}</b>")
+            parts.append(f"Valid: <b>{'✅' if nl_valid else '❌'}</b>")
         if nl_international:
-            items.append(f"International: <code>{nl_international}</code>")
+            parts.append(f"International: <code>{nl_international}</code>")
         if nl_country:
-            items.append(f"Country: {nl_country}")
+            parts.append(f"Country: {nl_country}")
         if nl_carrier:
-            items.append(f"Carrier: {nl_carrier}")
+            parts.append(f"Carrier: {nl_carrier}")
         if nl_line:
-            items.append(f"Type: {nl_line}")
-        if not items:
-            items.append("Unknown")
-        parts.extend(items)
+            parts.append(f"Type: {nl_line}")
     else:
-        parts.append(f"❌ error (status={nl.get('status')})")
+        parts.append(f"❌ error (status={nl.get('status')}): {nl.get('error')}")
 
-    # SMSMobile WhatsApp
+    # WhatsApp check
     parts.append("\n<b>WhatsApp</b>")
     if sm.get("ok"):
         if sm_found is not None:
@@ -173,6 +152,6 @@ def format_result_markdown(result: Dict[str, Any]) -> str:
         else:
             parts.append(f"Ответ: <code>{json.dumps(sm_data, ensure_ascii=False)}</code>")
     else:
-        parts.append(f"❌ error (status={sm.get('status')})")
+        parts.append(f"❌ error (status={sm.get('status')}): {sm.get('error')}")
 
     return "\n".join(parts)
