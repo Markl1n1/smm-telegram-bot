@@ -11,7 +11,7 @@ NUMLOOKUP_API_KEY = os.getenv(
 )
 SMSMOBILE_API_KEY = os.getenv(
     "SMSMOBILE_API_KEY",
-    "2e83b76b788bd1fed079505f513a420b45b0ee9db85d372d",
+    "e40a6bce72b0127b4f241fb19085d28447b2059729ee1bc3",
 )
 
 NUMLOOKUP_ENDPOINT = "https://api.numlookupapi.com/v1/validate/{number}"
@@ -64,8 +64,8 @@ def query_numlookup(number: str) -> Dict[str, Any]:
 def query_smsmobile(number: str) -> Dict[str, Any]:
     """Call smsmobileapi.com WhatsApp checknumber endpoint with retries."""
     params = {
-        "recipients": digits_only(number),
         "apikey": SMSMOBILE_API_KEY,
+        "recipients": digits_only(number)
     }
     last_err = None
     for attempt in range(3):
