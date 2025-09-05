@@ -64,8 +64,8 @@ def query_numlookup(number: str) -> Dict[str, Any]:
 def query_smsmobile(number: str) -> Dict[str, Any]:
     """Call smsmobileapi.com WhatsApp checknumber endpoint with retries."""
     params = {
-        "apikey": SMSMOBILE_API_KEY,
         "recipients": digits_only(number),
+        "apikey": SMSMOBILE_API_KEY,
     }
     last_err = None
     for attempt in range(3):
