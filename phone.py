@@ -144,14 +144,4 @@ def format_result_markdown(result: Dict[str, Any]) -> str:
     else:
         parts.append(f"❌ error (status={nl.get('status')}): {nl.get('error')}")
 
-    # WhatsApp check
-    parts.append("\n<b>WhatsApp</b>")
-    if sm.get("ok"):
-        if sm_found is not None:
-            parts.append(f"Whatsapp: <b>{'✅' if sm_found else '❌'}</b>")
-        else:
-            parts.append(f"Ответ: <code>{json.dumps(sm_data, ensure_ascii=False)}</code>")
-    else:
-        parts.append(f"❌ error (status={sm.get('status')}): {sm.get('error')}")
-
     return "\n".join(parts)
