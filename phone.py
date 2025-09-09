@@ -4,20 +4,15 @@ import json
 import requests
 from typing import Dict, Any
 
-# --- API keys (env vars win; fall back to defaults) ---
+# --- API key (env vars win; fall back to default) ---
 NUMLOOKUP_API_KEY = os.getenv(
     "NUMLOOKUP_API_KEY",
     "num_live_tcLFYRa5HmnTr5CgiClWzwTSu4qYT94aswZw1EWe",
 )
-SMSMOBILE_API_KEY = os.getenv(
-    "SMSMOBILE_API_KEY",
-    "e40a6bce72b0127b4f241fb19085d28447b2059729ee1bc3",
-)
 
 NUMLOOKUP_ENDPOINT = "https://api.numlookupapi.com/v1/validate/{number}"
-SMSMOBILE_ENDPOINT = "https://api.smsmobileapi.com/whatsapp/checknumber/"
 
-# Separate connect/read timeouts (connect=5s, read=25s)
+# Separate connect/read timeouts (connect=1s, read=10s)
 HTTP_TIMEOUT = (1, 10)
 
 
@@ -32,21 +27,11 @@ def normalize_number(user_input: str) -> str:
     return re.sub(r"\D", "", s)
 
 
-def digits_only(number: str) -> str:
-    """Digits only version (used by smsmobileapi's 'recipients')."""
-    return re.sub(r"\D", "", number)
-
-
 def _safe_get_json(resp: requests.Response) -> Any:
     try:
         return resp.json()
     except Exception:
         return {"raw_text": resp.text}
-
-
-def _sanitize_url(url: str) -> str:
-    """Remove API key for safe logging."""
-    return re.sub(r"(apikey=)[^&]+", r"\1***", url)
 
 
 def query_numlookup(number: str) -> Dict[str, Any]:
@@ -61,25 +46,8 @@ def query_numlookup(number: str) -> Dict[str, Any]:
         return {"ok": False, "status": None, "error": str(e)}
 
 
-def query_smsmobile(number: str) -> Dict[str, Any]:
-    """Call smsmobileapi.com WhatsApp checknumber endpoint with retries."""
-    params = {
-        "apikey": SMSMOBILE_API_KEY,
-        "recipients": digits_only(number)
-    }
-    last_err = None
-    for attempt in range(3):
-        try:
-            r = requests.get(SMSMOBILE_ENDPOINT, params=params, timeout=HTTP_TIMEOUT)
-            data = _safe_get_json(r)
-            return {"ok": r.ok, "status": r.status_code, "data": data}
-        except requests.RequestException as e:
-            last_err = str(e)
-    return {"ok": False, "status": None, "error": last_err}
-
-
 def check_phone(user_input: str) -> Dict[str, Any]:
-    """Run both checks and return structured result."""
+    """Run Numlookup check and return structured result."""
     normalized = normalize_number(user_input)
     if not normalized or normalized in {"+", ""}:
         return {
@@ -89,25 +57,22 @@ def check_phone(user_input: str) -> Dict[str, Any]:
         }
 
     numlookup = query_numlookup(normalized)
-    smsmobile = query_smsmobile(normalized)
 
     return {
         "ok": True,
         "input": user_input,
         "normalized": normalized,
         "numlookupapi": numlookup,
-        "smsmobileapi": smsmobile,
     }
 
 
 def format_result_markdown(result: Dict[str, Any]) -> str:
-    """Build HTML-formatted result message for Telegram."""
+    """Build HTML-formatted result message for Telegram (Numlookup only)."""
     if not result.get("ok"):
         return f"❌ <b>Ошибка</b>: {result.get('error', 'Unknown error')}"
 
     normalized = result.get("normalized", "")
     nl = result.get("numlookupapi", {})
-    sm = result.get("smsmobileapi", {})
 
     # Numlookup fields
     nl_data = nl.get("data") or {}
@@ -116,14 +81,6 @@ def format_result_markdown(result: Dict[str, Any]) -> str:
     nl_country = nl_data.get("country_name")
     nl_carrier = nl_data.get("carrier")
     nl_line = nl_data.get("line_type")
-
-    # smsmobile WhatsApp field
-    sm_data = sm.get("data") or {}
-    sm_found = None
-    if isinstance(sm_data, dict):
-        v = sm_data.get("contact_found_on_whatsapp")
-        if isinstance(v, str):
-            sm_found = v.lower() in {"yes", "true", "1"}
 
     parts = []
     parts.append(f"🔎 <b>Проверка номера</b>: <code>{normalized}</code>")
